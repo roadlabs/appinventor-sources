@@ -105,9 +105,8 @@ public class NoProjectDialogBox extends DialogBox {
   @UiHandler("goToYR")
   void handleGoToYR(ClickEvent e) {
     this.hide();
-    TemplateUploadWizard.openProjectFromTemplate(Window.Location.getProtocol()
-        + "//appinventor.mit.edu/yrtoolkit/yr/aiaFiles/hello_bonjour/translate_tutorial.asc",
-        new NewTutorialProject());
+    new TemplateUploadWizard().createProjectFromExistingZip(
+        "TranslateApp", new NewTutorialProject(), "TranslateApp");
   }
 
   @UiHandler("noDialogNewProject")

@@ -345,8 +345,13 @@ public class BlocklyPanel extends HTMLPanel {
               try {
                 long projectId = Ode.getInstance().getCurrentYoungAndroidProjectId();
                 String projectName = Ode.getCurrentProject().getProjectName();
-                boolean result = connectCache(Long.toString(projectId), projectName);
-                resolve.apply(result);
+                if (isLocalWebRtc()) {
+                  exportProjectToCompanion((double) projectId, projectName,
+                      resolve, reject);
+                } else {
+                  boolean result = connectCache(Long.toString(projectId), projectName);
+                  resolve.apply(result);
+                }
               } catch (WrappedException e) {
                 reject.apply(new WrappedException(e));
               }
@@ -836,6 +841,36 @@ public class BlocklyPanel extends HTMLPanel {
   public native void removeAsset(String name)/*-{
     this.@com.google.appinventor.client.editor.blocks.BlocklyPanel::workspace
       .removeAsset(name);
+  }-*/;
+
+  private static native boolean isLocalWebRtc() /*-{
+    // The archive is locally available in both connection modes. The save
+    // implementation selects WebRTC or legacy PUT afterward.
+    return !!$wnd.AssetManager_exportProjectArchive;
+  }-*/;
+
+  private static native void exportProjectToCompanion(double projectId, String projectName,
+      Promise.ResolveCallback<Boolean> resolve, Promise.RejectCallback reject) /*-{
+    var callback = $entry(function(success, archiveOrError) {
+      if (!success) {
+        $wnd.console.error('Unable to export project: ' + archiveOrError);
+        reject(archiveOrError);
+        return;
+      }
+      var accepted = $wnd.Blockly.ReplMgr.saveProjectArchive(projectName, archiveOrError,
+          $entry(function() {
+            $wnd.console.log('Project saved to Companion: ' + projectName);
+            resolve(true);
+          }),
+          $entry(function(message) {
+            $wnd.console.error('Unable to save project to Companion: ' + message);
+            reject(message);
+          }));
+      if (!accepted) {
+        reject('Unable to queue project for Companion');
+      }
+    });
+    $wnd.AssetManager_exportProjectArchive(projectId, callback);
   }-*/;
 
   public static native boolean connectCache(String projectId, String projectName)/*-{

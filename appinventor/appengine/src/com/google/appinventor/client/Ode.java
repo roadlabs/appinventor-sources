@@ -2583,10 +2583,12 @@ public class Ode implements EntryPoint {
     }
 
     boolean isUrlAllowed = false;
-    for (String candidate : config.getTutorialsUrlAllowed()) {
-      if (newURL.startsWith(candidate)) {
-        isUrlAllowed = true;
-        break;
+    if (config != null && config.getTutorialsUrlAllowed() != null) {
+      for (String candidate : config.getTutorialsUrlAllowed()) {
+        if (candidate != null && newURL.startsWith(candidate)) {
+          isUrlAllowed = true;
+          break;
+        }
       }
     }
 

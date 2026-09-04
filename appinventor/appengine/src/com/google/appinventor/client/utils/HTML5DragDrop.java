@@ -16,6 +16,9 @@ import com.google.appinventor.client.boxes.ProjectListBox;
 import com.google.appinventor.client.editor.youngandroid.YaBlocksEditor;
 import com.google.appinventor.client.explorer.dialogs.NoProjectDialogBox;
 import com.google.appinventor.client.explorer.project.Project;
+import com.google.appinventor.client.local.LocalIdbStore;
+import com.google.appinventor.client.local.LocalProjectService;
+import com.google.appinventor.client.utils.Promise;
 import com.google.appinventor.client.wizards.ComponentImportWizard.ImportComponentCallback;
 import com.google.appinventor.client.wizards.RequestNewProjectNameWizard;
 import com.google.appinventor.client.wizards.RequestProjectNewNameInterface;
@@ -26,6 +29,9 @@ import com.google.appinventor.shared.rpc.project.UserProject;
 import com.google.appinventor.shared.rpc.project.youngandroid.YoungAndroidAssetNode;
 import com.google.appinventor.shared.rpc.project.youngandroid.YoungAndroidProjectNode;
 import com.google.appinventor.shared.storage.StorageUtil;
+
+import com.google.gwt.core.client.JavaScriptObject;
+import com.google.gwt.typedarrays.shared.ArrayBuffer;
 
 import com.google.gwt.core.client.GWT;
 
@@ -38,6 +44,7 @@ import com.google.gwt.event.dom.client.ClickHandler;
 import com.google.gwt.query.client.builders.JsniBundle;
 
 import com.google.gwt.user.client.Window;
+import com.google.gwt.user.client.rpc.AsyncCallback;
 import com.google.gwt.user.client.ui.Button;
 import com.google.gwt.user.client.ui.DialogBox;
 import com.google.gwt.user.client.ui.DockPanel;
@@ -109,6 +116,16 @@ public final class HTML5DragDrop {
       $entry(@com.google.appinventor.client.utils.HTML5DragDrop::checkProjectNameForCollision(*));
     top.HTML5DragDrop_shouldShowDropTarget =
       $entry(@com.google.appinventor.client.utils.HTML5DragDrop::shouldShowDropTarget(*));
+    top.HTML5DragDrop_isLocalMode =
+      $entry(@com.google.appinventor.client.utils.HTML5DragDrop::isLocalMode());
+    top.HTML5DragDrop_uploadAssetLocal =
+      $entry(@com.google.appinventor.client.utils.HTML5DragDrop::uploadAssetLocal(*));
+    top.HTML5DragDrop_uploadExtensionLocal =
+      $entry(@com.google.appinventor.client.utils.HTML5DragDrop::uploadExtensionLocal(*));
+    top.HTML5DragDrop_uploadKeystoreLocal =
+      $entry(@com.google.appinventor.client.utils.HTML5DragDrop::uploadKeystoreLocal(*));
+    top.HTML5DragDrop_importProjectLocal =
+      $entry(@com.google.appinventor.client.utils.HTML5DragDrop::importProjectLocal(*));
   }-*/;
 
 
@@ -261,13 +278,7 @@ public final class HTML5DragDrop {
             ode.getComponentService().importComponentToProject(response.getInfo(), projectId,
                 projectNode.getAssetsFolder().getFileId(), new ImportComponentCallback());
           } else if ("asset".equals(type)) {
-            long projectId = Long.parseLong(projectIdStr);
-            ode.updateModificationDate(projectId, response.getModificationDate());
-            Project project = ode.getProjectManager().getProject(projectId);
-            YoungAndroidProjectNode projectNode = (YoungAndroidProjectNode) project.getRootNode();
-            YoungAndroidAssetNode node = new YoungAndroidAssetNode(name,
-                projectNode.getAssetsFolder().getFileId() + "/" + name);
-            project.addNode(projectNode.getAssetsFolder(), node);
+            addAssetToProject(projectIdStr, name, response.getModificationDate());
           } else if ("keystore".equals(type)) {
             Ode.getInstance().getTopToolbar().updateKeystoreFileMenuButtons();
           }
@@ -285,6 +296,191 @@ public final class HTML5DragDrop {
       ErrorReporter.reportError(MESSAGES.fileUploadError());
     }
   }
+
+  private static void addAssetToProject(String projectIdStr, String name, long modificationDate) {
+    Ode ode = Ode.getInstance();
+    long projectId = Long.parseLong(projectIdStr);
+    ode.updateModificationDate(projectId, modificationDate);
+    Project project = ode.getProjectManager().getProject(projectId);
+    YoungAndroidProjectNode projectNode = (YoungAndroidProjectNode) project.getRootNode();
+    YoungAndroidAssetNode node = new YoungAndroidAssetNode(name,
+        projectNode.getAssetsFolder().getFileId() + "/" + name);
+    project.addNode(projectNode.getAssetsFolder(), node);
+  }
+
+  /**
+   * Returns whether the project service is the in-browser
+   * {@link LocalProjectService}. Used by the JS drag-drop layer to decide
+   * between the XHR upload path and the direct in-memory upload hook.
+   */
+  public static boolean isLocalMode() {
+    return Ode.getInstance().getProjectService() instanceof LocalProjectService;
+  }
+
+  /**
+   * Receives a dropped file from the JS drag-drop layer in offline mode. Reads
+   * the blob bytes via FileReader, persists them through {@link LocalProjectService}, and adds
+   * the asset node to the project tree (mirroring the online success path).
+   *
+   * @param projectIdStr the project id as a string (from
+   *     {@code top.HTML5DragDrop_getOpenProjectId})
+   * @param blob the dropped {@code Blob} (a {@code File} is also a {@code Blob})
+   */
+  public static void uploadAssetLocal(String projectIdStr, JavaScriptObject blob) {
+    final long projectId;
+    try {
+      projectId = Long.parseLong(projectIdStr);
+    } catch (NumberFormatException e) {
+      reportError(1);
+      return;
+    }
+    String name = blobName(blob);
+    if (name == null || name.isEmpty()) {
+      reportError(1);
+      return;
+    }
+    final String fileId = "assets/" + name;
+    LocalProjectService svc = (LocalProjectService) Ode.getInstance().getProjectService();
+    readBlob(blob).then(buffer -> svc.saveContent(projectId, fileId, buffer))
+        .then(date -> {
+          addAssetToProject(projectIdStr, name, date);
+          return Promise.resolve(null);
+        })
+        .error(err -> {
+          ErrorReporter.reportError(MESSAGES.fileUploadError());
+          return null;
+        });
+  }
+
+  /**
+   * Receives a dropped {@code .aix} extension from the JS drag-drop layer in
+   * offline mode. Reads the blob bytes via FileReader, base64-encodes them
+   * (for JSZip's base64 input mode), then delegates to
+   * {@link com.google.appinventor.client.local.LocalComponentService#importComponentToProject}.
+   * On success, replicates the {@code ImportComponentCallback.onSuccess} flow
+   * (add node to components folder, call {@code projectEditor.importExtension})
+   * to register the extension in the palette.
+   *
+   * @param projectIdStr the project id as a string (from
+   *     {@code top.HTML5DragDrop_getOpenProjectId})
+   * @param blob the dropped {@code Blob} (a {@code File} is also a {@code Blob})
+   */
+  public static void uploadExtensionLocal(String projectIdStr, JavaScriptObject blob) {
+    final long projectId;
+    try {
+      projectId = Long.parseLong(projectIdStr);
+    } catch (NumberFormatException e) {
+      reportError(1);
+      return;
+    }
+    final Project project = Ode.getInstance().getProjectManager().getProject(projectId);
+    if (project == null) {
+      reportError(1);
+      return;
+    }
+    final YoungAndroidProjectNode projectNode =
+        (YoungAndroidProjectNode) project.getRootNode();
+    final com.google.appinventor.client.editor.youngandroid.YaProjectEditor projectEditor =
+        (com.google.appinventor.client.editor.youngandroid.YaProjectEditor)
+            Ode.getInstance().getEditorManager().getOpenProjectEditor(projectId);
+    if (projectEditor == null) {
+      reportError(1);
+      return;
+    }
+    readBlobBase64(blob).then(base64 -> {
+      com.google.appinventor.client.local.LocalComponentService svc =
+          (com.google.appinventor.client.local.LocalComponentService)
+              Ode.getInstance().getComponentService();
+      svc.importComponentToProject(base64, projectId,
+          projectNode.getAssetsFolder().getFileId(),
+          new ImportComponentCallback());
+      return Promise.resolve(null);
+    }).error(err -> {
+      ErrorReporter.reportError(MESSAGES.fileUploadError());
+      return null;
+    });
+  }
+
+  /** Stores a dropped Android keystore in the local user-file store. */
+  public static void uploadKeystoreLocal(JavaScriptObject blob) {
+    readBlob(blob)
+        .then(buffer -> LocalIdbStore.putUserFile(StorageUtil.ANDROID_KEYSTORE_FILENAME, buffer))
+        .then(value -> {
+          Ode.getInstance().getTopToolbar().updateKeystoreFileMenuButtons();
+          return Promise.resolve(null);
+        })
+        .error(err -> {
+          ErrorReporter.reportError(MESSAGES.uploadKeystoreError());
+          return null;
+        });
+  }
+
+  /**
+   * Imports an .aia downloaded from a repository in offline mode. The normal
+   * path posts the file to UploadServlet, which is unavailable in the static
+   * offline webapp.
+   */
+  public static void importProjectLocal(String projectName, JavaScriptObject blob) {
+    if (projectName == null || projectName.isEmpty()) {
+      ErrorReporter.reportError(MESSAGES.projectUploadError());
+      return;
+    }
+    readBlobBase64(blob)
+        .then(base64 -> {
+          LocalProjectService svc = (LocalProjectService) Ode.getInstance().getProjectService();
+          svc.newProjectFromExternalTemplate(projectName, base64,
+              new AsyncCallback<UserProject>() {
+                @Override
+                public void onSuccess(UserProject project) {
+                  if (project == null) {
+                    ErrorReporter.reportError(MESSAGES.projectUploadError());
+                    return;
+                  }
+                  Project imported = Ode.getInstance().getProjectManager().addProject(project);
+                  Ode.getInstance().openYoungAndroidProjectInDesigner(imported);
+                }
+
+                @Override
+                public void onFailure(Throwable caught) {
+                  ErrorReporter.reportError(MESSAGES.projectUploadError());
+                }
+              });
+          return Promise.resolve(null);
+        })
+        .error(err -> {
+          ErrorReporter.reportError(MESSAGES.projectUploadError());
+          return null;
+        });
+  }
+
+  /** Reads a Blob and resolves with its bytes encoded as a base64 String. */
+  private static native Promise<String> readBlobBase64(JavaScriptObject blob) /*-{
+    return new Promise(function(resolve, reject) {
+      var reader = new FileReader();
+      reader.onload  = function(ev) {
+        // ev.target.result is "data:<mime>;base64,<payload>" — strip prefix.
+        var s = String(ev.target.result || '');
+        var idx = s.indexOf('base64,');
+        resolve(idx >= 0 ? s.substring(idx + 'base64,'.length) : s);
+      };
+      reader.onerror = function(ev) { reject(new Error('Failed to read dropped file')); };
+      reader.readAsDataURL(blob);
+    });
+  }-*/;
+
+  private static native String blobName(JavaScriptObject blob) /*-{
+    try { return blob && blob.name ? String(blob.name) : ''; }
+    catch (e) { return ''; }
+  }-*/;
+
+  private static native Promise<ArrayBuffer> readBlob(JavaScriptObject blob) /*-{
+    return new Promise(function(resolve, reject) {
+      var reader = new FileReader();
+      reader.onload  = function(ev) { resolve(ev.target.result); };
+      reader.onerror = function(ev) { reject(new Error('Failed to read dropped file')); };
+      reader.readAsArrayBuffer(blob);
+    });
+  }-*/;
 
   /**
    * Determines whether the given element or an ancestor constitutes a drop target. If so, it will

@@ -1,0 +1,84 @@
+name: build-desktop
+
+on:
+  push:
+    branches: [vibe]
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '**.txt'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub Release after building'
+        type: boolean
+        required: true
+        default: false
+      tag:
+        description: 'Release tag; blank uses vibe-<sha> for a dev release'
+        type: string
+        required: false
+        default: ''
+
+concurrency:
+  group: build-desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions: {}
+
+jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '11'
+      - name: Build offline-webapp
+        shell: bash
+        run: ./offline-tauri/build-webapp.sh "$GITHUB_WORKSPACE"
+      - name: Zip frontend
+        run: zip -r offline-webapp.zip offline-webapp/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend
+          path: offline-webapp.zip
+          retention-days: 14
+
+  build:
+    needs: build-frontend
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend
+      - name: Unpack frontend
+        shell: bash
+        run: unzip -q offline-webapp.zip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Tauri CLI 2
+        run: cargo install tauri-cli --version "^2.0" --locked
+      - name: Build Tauri 2 app
+        working-directory: offline-tauri/src-tauri
+        run: cargo tauri build --target ${{ matrix.target }}

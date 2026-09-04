@@ -10,6 +10,8 @@ import static com.google.appinventor.client.Ode.MESSAGES;
 
 import com.google.appinventor.client.explorer.project.Project;
 import com.google.appinventor.client.explorer.project.ProjectChangeListener;
+import com.google.appinventor.client.local.LocalProjectService;
+import com.google.appinventor.client.utils.Promise;
 
 import com.google.appinventor.common.utils.StringUtils;
 
@@ -285,6 +287,13 @@ public final class AssetManager implements ProjectChangeListener {
     if (transferredAsset == null)
       return false;
     AssetInfo assetInfo = INSTANCE.assets.get(transferredAsset);
+    if (assetInfo == null) {
+      // Extension files (classes.jar, components.json under external_comps/) are
+      // pushed via the same ReplMgr putAsset path but aren't tracked in the
+      // assets map — return true silently so the browser's extension push
+      // counter still progresses.
+      return true;
+    }
     assetInfo.transferred = true;
     // Let's see if all assets are transferred. If so, fire the
     // assetsTransferredCallback
@@ -300,6 +309,28 @@ public final class AssetManager implements ProjectChangeListener {
     doCallBack(assetsTransferredCallback);
     return  true;
   }
+
+  /** Returns a complete .aia archive for the current local project. */
+  public static void exportProjectArchive(double projectId, JavaScriptObject callback) {
+    if (!(Ode.getInstance().getProjectService() instanceof LocalProjectService)) {
+      doProjectExportFailure(callback, "Local project storage is unavailable");
+      return;
+    }
+    LocalProjectService svc = (LocalProjectService) Ode.getInstance().getProjectService();
+    exportProjectArchiveNative(svc, projectId, callback);
+  }
+
+  private static native void exportProjectArchiveNative(LocalProjectService svc, double projectId,
+      JavaScriptObject callback) /*-{
+    var promise = svc.@com.google.appinventor.client.local.LocalProjectService::exportProjectFromJavaScript(D)(projectId);
+    // Attach the rejection handler through then's second argument. GWT's
+    // JSNI parser does not accept the native Promise catch() property syntax.
+    promise.then(function(archive) {
+      callback(true, archive);
+    }, function(error) {
+      callback(false, String(error));
+    });
+  }-*/;
 
   public static JsArrayString getExtensionsToLoad() {
     JsArrayString result = JsArrayString.createArray().cast();
@@ -348,10 +379,26 @@ public final class AssetManager implements ProjectChangeListener {
       $entry(@com.google.appinventor.client.AssetManager::markAssetTransferred(Ljava/lang/String;));
     $wnd.AssetManager_getExtensions =
       $entry(@com.google.appinventor.client.AssetManager::getExtensionsToLoad());
+    $wnd.AssetManager_exportProjectArchive =
+      $entry(@com.google.appinventor.client.AssetManager::exportProjectArchive(DLcom/google/gwt/core/client/JavaScriptObject;));
   }-*/;
 
   private static native boolean doPutAsset(String projectId, String filename, byte[] content) /*-{
     return $wnd.Blockly.ReplMgr.putAsset(projectId, filename, content, function() { window.parent.AssetManager_markAssetTransferred(filename) });
+  }-*/;
+
+  private static native void doProjectExportCallback(JavaScriptObject callback, boolean success,
+      JavaScriptObject files) /*-{
+    if (typeof callback === 'function') callback(success, files);
+  }-*/;
+
+  private static native void doProjectExportFailure(JavaScriptObject callback, String message) /*-{
+    if (typeof callback === 'function') callback(false, message);
+  }-*/;
+
+  private static native void doProjectArchiveCallback(JavaScriptObject callback, boolean success,
+      String archive) /*-{
+    if (typeof callback === 'function') callback(success, archive);
   }-*/;
 
   private static native void doCallBack(JavaScriptObject callback) /*-{

@@ -9,6 +9,7 @@ import com.google.appinventor.shared.rpc.user.Config;
 import com.google.appinventor.shared.rpc.user.SplashConfig;
 import com.google.appinventor.shared.rpc.user.User;
 import com.google.appinventor.shared.rpc.user.UserInfoServiceAsync;
+import com.google.gwt.typedarrays.shared.ArrayBuffer;
 import com.google.gwt.user.client.rpc.AsyncCallback;
 
 public class LocalUserInfoService implements UserInfoServiceAsync {
@@ -37,27 +38,43 @@ public class LocalUserInfoService implements UserInfoServiceAsync {
 
   @Override
   public void storeUserBackpack(String backpack, AsyncCallback<Void> callback) {
-
+    callback.onSuccess(null);
   }
 
   @Override
   public void storeUserSettings(String settings, AsyncCallback<Void> callback) {
-
+    callback.onSuccess(null);
   }
 
   @Override
   public void hasUserFile(String fileName, AsyncCallback<Boolean> callback) {
-
+    LocalIdbStore.hasUserFile(fileName)
+        .then(value -> {
+          callback.onSuccess(value);
+          return com.google.appinventor.client.utils.Promise.resolve(null);
+        })
+        .error(error -> {
+          callback.onFailure(error);
+          return null;
+        });
   }
 
   @Override
   public void deleteUserFile(String fileName, AsyncCallback<Void> callback) {
-
+    LocalIdbStore.deleteUserFile(fileName)
+        .then(value -> {
+          callback.onSuccess(null);
+          return com.google.appinventor.client.utils.Promise.resolve(null);
+        })
+        .error(error -> {
+          callback.onFailure(error);
+          return null;
+        });
   }
 
   @Override
   public void noop(AsyncCallback<Void> callback) {
-
+    callback.onSuccess(null);
   }
 
   @Override

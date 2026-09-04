@@ -10,6 +10,7 @@ import com.google.appinventor.client.Ode;
 import static com.google.appinventor.client.Ode.MESSAGES;
 import com.google.appinventor.client.OdeAsyncCallback;
 import com.google.appinventor.client.settings.project.ProjectSettings;
+import com.google.appinventor.client.utils.Promise;
 import com.google.appinventor.client.tracking.Tracking;
 import com.google.appinventor.shared.rpc.project.ProjectNode;
 import com.google.appinventor.shared.rpc.project.ProjectRootNode;
@@ -58,30 +59,31 @@ public final class Project {
     if (projectRoot == null && !loadingInProgress) {
       loadingInProgress = true;
 
+      // Project editors read project settings while they are being constructed.
+      // Load settings before notifying listeners that the project tree is ready;
+      // otherwise a fast local service can fire onProjectLoaded while settings are
+      // still null or only partially initialized.
+      Promise<ProjectSettings> settingsPromise;
       if (settings == null) {
         settings = new ProjectSettings(Project.this);
-        settings.loadSettings();
+        settingsPromise = settings.loadSettings();
+      } else {
+        settingsPromise = Promise.resolve(settings);
       }
 
-      Ode.getInstance().getProjectService().getProject(
-          getProjectId(),
-          new OdeAsyncCallback<ProjectRootNode>(
-              // failure message
-              MESSAGES.projectLoadError()) {
-            @Override
-            public void onSuccess(ProjectRootNode result) {
-              projectRoot = result;
-
-              loadingInProgress = false;
-              fireProjectLoaded();
-            }
-
-            @Override
-            public void onFailure(Throwable caught) {
-              loadingInProgress = false;
-              super.onFailure(caught);
-            }
-      });
+      settingsPromise
+          .then(ignored -> Promise.<ProjectRootNode>call(MESSAGES.projectLoadError(),
+              callback -> Ode.getInstance().getProjectService().getProject(getProjectId(), callback)))
+          .then(result -> {
+            projectRoot = result;
+            loadingInProgress = false;
+            fireProjectLoaded();
+            return Promise.resolve(null);
+          })
+          .error(caught -> {
+            loadingInProgress = false;
+            return null;
+          });
     }
   }
 

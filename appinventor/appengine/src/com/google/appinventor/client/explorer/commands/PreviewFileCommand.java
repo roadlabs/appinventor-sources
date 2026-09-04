@@ -5,12 +5,16 @@
 
 package com.google.appinventor.client.explorer.commands;
 
+import com.google.appinventor.client.Ode;
+import com.google.appinventor.client.local.LocalProjectService;
+import com.google.appinventor.client.utils.Promise;
+import com.google.appinventor.shared.rpc.project.ProjectNode;
+import com.google.appinventor.shared.rpc.project.ProjectServiceAsync;
 import com.google.appinventor.shared.storage.StorageUtil;
 import com.google.gwt.dom.client.Document;
 import com.google.gwt.dom.client.StyleElement;
 import com.google.gwt.event.dom.client.ClickEvent;
 import com.google.gwt.event.dom.client.ClickHandler;
-import com.google.appinventor.shared.rpc.project.ProjectNode;
 import com.google.gwt.event.dom.client.KeyUpEvent;
 import com.google.gwt.event.dom.client.KeyUpHandler;
 import com.google.gwt.event.logical.shared.ValueChangeEvent;
@@ -45,15 +49,46 @@ public class PreviewFileCommand extends ChainableCommand {
 
   @Override
   public void execute(final ProjectNode node) {
+    final ProjectServiceAsync projectService = Ode.getInstance().getProjectService();
+    if (projectService instanceof LocalProjectService) {
+      executeLocal((LocalProjectService) projectService, node);
+      return;
+    }
+    executeServer(node);
+  }
+
+  private void executeServer(final ProjectNode node) {
+    showDialog(node, generateFilePreview(node));
+  }
+
+  private void executeLocal(LocalProjectService projectService, final ProjectNode node) {
+    // Unbounded size so the user can preview any file they can otherwise store.
+    final int unboundedSize = Integer.MAX_VALUE;
+    projectService.getAssetDataUrl(node.getProjectId(), node.getFileId(), unboundedSize)
+        .then(dataUrl -> {
+          Widget preview;
+          if (dataUrl == null || dataUrl.isEmpty()) {
+            preview = new HTML(MESSAGES.filePreviewError());
+          } else {
+            preview = generateDataUrlPreview(node, dataUrl);
+          }
+          showDialog(node, preview);
+          return Promise.resolve(null);
+        })
+        .error(err -> {
+          showDialog(node, new HTML(MESSAGES.filePreviewError()));
+          return null;
+        });
+  }
+
+  private void showDialog(final ProjectNode node, Widget filePreview) {
     final DialogBox dialogBox = new DialogBox();
     dialogBox.setText(node.getName());
     dialogBox.setStylePrimaryName("ode-DialogBox");
 
-    //setting position of dialog box
     dialogBox.center();
     dialogBox.setAnimationEnabled(true);
 
-    //button element
     final Button closeButton = new Button(MESSAGES.closeFilePreview());
     closeButton.getElement().setId("closeButton");
     closeButton.addClickHandler(new ClickHandler() {
@@ -72,7 +107,6 @@ public class PreviewFileCommand extends ChainableCommand {
     dialogPanel.setHorizontalAlignment(VerticalPanel.ALIGN_CENTER);
     dialogPanel.setVerticalAlignment(VerticalPanel.ALIGN_MIDDLE);
 
-    Widget filePreview = generateFilePreview(node);
     dialogPanel.clear();
     dialogPanel.add(filePreview);
 
@@ -82,10 +116,34 @@ public class PreviewFileCommand extends ChainableCommand {
     dialogBox.setGlassEnabled(false);
     dialogBox.setModal(false);
 
-    // Set the contents of the Widget
     dialogBox.setWidget(dialogPanel);
     dialogBox.center();
     dialogBox.show();
+  }
+
+  /**
+   * Build a preview widget from a {@code data:} URL (used in offline mode where
+   * there is no server endpoint to fetch from). Mirrors {@link #generateFilePreview}
+   * for the asset types that browsers can render inline.
+   */
+  private Widget generateDataUrlPreview(ProjectNode node, String dataUrl) {
+    String fileSuffix = node.getProjectId() + "/" + node.getFileId();
+    if (StorageUtil.isImageFile(fileSuffix)) {
+      Image img = new Image(dataUrl);
+      img.getElement().getStyle().setProperty("maxWidth", "600px");
+      return img;
+    } else if (StorageUtil.isAudioFile(fileSuffix)) {
+      String fileType = StorageUtil.getContentTypeForFilePath(fileSuffix);
+      return new HTML("<audio controls><source src='" + dataUrl + "' type='" + fileType
+          + "'>" + MESSAGES.filePlaybackError() + "</audio>");
+    } else if (StorageUtil.isVideoFile(fileSuffix)) {
+      String fileType = StorageUtil.getContentTypeForFilePath(fileSuffix);
+      return new HTML("<video width='320' height='240' controls><source src='" + dataUrl
+          + "' type='" + fileType + "'>" + MESSAGES.filePlaybackError() + "</video>");
+    } else if (StorageUtil.isFontFile(fileSuffix)) {
+      return getFontResourcePreviewPanel(dataUrl);
+    }
+    return new HTML(MESSAGES.filePreviewError());
   }
 
   /**

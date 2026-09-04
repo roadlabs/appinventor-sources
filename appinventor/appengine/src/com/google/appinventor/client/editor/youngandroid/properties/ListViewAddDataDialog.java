@@ -10,6 +10,7 @@ import static com.google.appinventor.client.Ode.MESSAGES;
 import com.google.appinventor.client.Ode;
 import com.google.appinventor.client.editor.simple.SimpleEditor;
 import com.google.appinventor.client.explorer.project.Project;
+import com.google.appinventor.client.local.LocalProjectService;
 import com.google.appinventor.client.wizards.Dialog;
 
 import com.google.appinventor.components.common.ComponentConstants;
@@ -179,7 +180,12 @@ public class ListViewAddDataDialog {
     if (assetsFolder != null) {
       for (ProjectNode node : assetsFolder.getChildren()) {
         choices.add(node.getName());
-        urls.put(node.getName(), StorageUtil.getFileUrl(node.getProjectId(), node.getFileId()));
+        // Offline mode: image previews in this dialog come from IndexedDB.
+        String localUrl = LocalProjectService.getLocalAssetDataUrl(node.getProjectId(),
+            node.getFileId());
+        urls.put(node.getName(),
+            localUrl != null ? localUrl
+                : StorageUtil.getFileUrl(node.getProjectId(), node.getFileId()));
       }
     }
     return choices;

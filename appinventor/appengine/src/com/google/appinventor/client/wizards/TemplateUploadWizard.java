@@ -178,14 +178,25 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
    * @param jsonStr
    */
   public static void setStoredTemplateUrls(String jsonStr) {
-    if (jsonStr == null || jsonStr.length() == 0)
+    dynamicTemplateUrls.clear();
+    if (jsonStr == null || jsonStr.length() == 0) {
       return;
-    JSONValue jsonVal = JSONParser.parseLenient(jsonStr);
-    JSONArray jsonArr = jsonVal.isArray();
-    for (int i = 0; i < jsonArr.size(); i++) {
-      JSONValue value = jsonArr.get(i);
-      JSONString str = value.isString();
-      dynamicTemplateUrls.add(str.stringValue());
+    }
+    try {
+      JSONValue jsonVal = JSONParser.parseLenient(jsonStr);
+      JSONArray jsonArr = jsonVal == null ? null : jsonVal.isArray();
+      if (jsonArr == null) {
+        return;
+      }
+      for (int i = 0; i < jsonArr.size(); i++) {
+        JSONValue value = jsonArr.get(i);
+        JSONString str = value == null ? null : value.isString();
+        if (str != null && !dynamicTemplateUrls.contains(str.stringValue())) {
+          dynamicTemplateUrls.add(str.stringValue());
+        }
+      }
+    } catch (Exception e) {
+      // Ignore corrupt stored settings; the built-in repository remains usable.
     }
   }
 
@@ -232,8 +243,9 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
        "thumbnail":"thumbnail.png" }
   */
   public static void initializeBuiltInTemplates(String json) {
-    templateDataString = json;
+    templateDataString = json == null ? "[]" : json;
     builtInTemplates = getTemplates();
+    templatesMap.remove(MIT_TEMPLATES);
     templatesMap.put(MIT_TEMPLATES, builtInTemplates);
   }
 
@@ -286,14 +298,22 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
    * @return ArrayList of TemplateInfo objects
    */
   protected static ArrayList<TemplateInfo> getTemplates() {
-    JSONValue jsonVal = JSONParser.parseLenient(templateDataString);
-    JSONArray jsonArr = jsonVal.isArray();
     ArrayList<TemplateInfo> templates = new ArrayList<TemplateInfo>();
-    for (int i = 0; i < jsonArr.size(); i++) {
-      JSONValue value = jsonArr.get(i);
-      JSONObject obj = value.isObject();
-      if (obj != null)
-        templates.add(new TemplateInfo(obj)); // Create TemplateInfo from Json
+    try {
+      JSONValue jsonVal = JSONParser.parseLenient(templateDataString == null ? "[]" : templateDataString);
+      JSONArray jsonArr = jsonVal == null ? null : jsonVal.isArray();
+      if (jsonArr == null) {
+        return templates;
+      }
+      for (int i = 0; i < jsonArr.size(); i++) {
+        JSONValue value = jsonArr.get(i);
+        JSONObject obj = value == null ? null : value.isObject();
+        if (obj != null && obj.get("name") != null) {
+          templates.add(new TemplateInfo(obj));
+        }
+      }
+    } catch (Exception e) {
+      // A corrupt manifest is treated as an empty repository and reported by the UI.
     }
     return templates;
   }
@@ -311,6 +331,9 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
 
     // Initialize the UI
     this.setStylePrimaryName("ode-DialogBox");
+    selectedTemplateNAME = null;
+    usingExternalTemplate = false;
+    templateHostUrl = "";
     setUpUiAndFinishCommand();
   }
 
@@ -349,6 +372,10 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
     initFinishCommand(new Command() {
         @Override
         public void execute() {
+          if (selectedTemplateNAME == null || selectedTemplateNAME.isEmpty()) {
+            Window.alert("Please select a template before continuing.");
+            return;
+          }
           // Make sure the project name is legal and unique.
           if (TextValidators.checkNewProjectName(selectedTemplateNAME, true) 
                   != TextValidators.ProjectNameStatus.SUCCESS) {
@@ -396,15 +423,20 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
    * @return the main panel for Wizard dialog.
    */
   VerticalPanel createUI(final ArrayList<TemplateInfo> templates) {
+    final ArrayList<TemplateInfo> safeTemplates = templates == null
+        ? new ArrayList<TemplateInfo>() : templates;
     VerticalPanel panel = new VerticalPanel();
     panel.setStylePrimaryName("gwt-SimplePanel");
     panel.setVerticalAlignment(VerticalPanel.ALIGN_MIDDLE);
     panel.setHorizontalAlignment(VerticalPanel.ALIGN_CENTER);
 
     templatePanel = new HorizontalPanel();
-    templatePanel.add(makeTemplateSelector(templates));
-    if (templates.size() > 0)
-      templatePanel.add(new TemplateWidget(templates.get(0), templateHostUrl));
+    templatePanel.add(makeTemplateSelector(safeTemplates));
+    if (!safeTemplates.isEmpty()) {
+      templatePanel.add(new TemplateWidget(safeTemplates.get(0), templateHostUrl));
+    } else {
+      templatePanel.add(new Label("No templates are available in this repository."));
+    }
 
     templatesMenu = makeTemplatesMenu();
 
@@ -557,7 +589,9 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
       hostUrl = pendingUrl;
       pendingUrl = "";
       if (templates != null) {
-        dynamicTemplateUrls.add(hostUrl);
+        if (!dynamicTemplateUrls.contains(hostUrl)) {
+          dynamicTemplateUrls.add(hostUrl);
+        }
         templatesMenu.addItem(hostUrl);
         templatesMenu.setSelectedIndex(templatesMenu.getItemCount()-1);  // Last item
         lastSelectedIndex = templatesMenu.getSelectedIndex();
@@ -568,8 +602,10 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
       }
     }
 
-    if (templates == null)
-      return;
+    if (templates == null) {
+      templates = new ArrayList<TemplateInfo>();
+    }
+    selectedTemplateNAME = null;
 
     // Display the templates for the the selected Url.
     for (int k = 0; k < templatePanel.getWidgetCount(); k++) {
@@ -580,9 +616,13 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
     templatePanel = new HorizontalPanel();
     // Add the new templates
     templatePanel.add(makeTemplateSelector(templates));
-    if (templates.size() > 0)
+    if (!templates.isEmpty()) {
       templatePanel.add(new TemplateWidget(templates.get(0), templateHostUrl));
+    } else {
+      templatePanel.add(new Label("No templates are available in this repository."));
+    }
     parent.add(templatePanel);
+    setFinishEnabled(!templates.isEmpty());
   }
 
   /**
@@ -597,9 +637,7 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
 
     // Callback for updating the project explorer after the project is created on the back-end
     final Ode ode = Ode.getInstance();
-    final OdeAsyncCallback<UserProject> callback = new OdeAsyncCallback<UserProject>(
-        // failure message
-        MESSAGES.createProjectError()) {
+    final OdeAsyncCallback<UserProject> callback = new OdeAsyncCallback<UserProject>() {
       @Override
       public void onSuccess(UserProject projectInfo) {
         // Update project explorer -- i.e., display in project view
@@ -636,6 +674,11 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
 
             @Override
             public void onResponseReceived(Request request, Response response) {
+              if (response == null || response.getStatusCode() != Response.SC_OK
+                  || response.getText() == null || response.getText().isEmpty()) {
+                Window.alert("Unable to load project template archive.");
+                return;
+              }
               ode.getProjectService().newProjectFromExternalTemplate(projectNameInExplorer,
                       response.getText(), callback);
             }
@@ -652,8 +695,11 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
   }
 
   private static boolean isTemplateName(String name) {
+    if (name == null || builtInTemplates == null) {
+      return false;
+    }
     for (TemplateInfo template : builtInTemplates) {
-      if (template.name.equals(name)) {
+      if (template != null && name.equals(template.name)) {
         return true;
       }
     }
@@ -728,9 +774,7 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
     final Ode ode = Ode.getInstance();
 
     // This Async callback is called after the project is input and created
-    final OdeAsyncCallback<UserProject> callback = new OdeAsyncCallback<UserProject>(
-        // failure message
-        MESSAGES.createProjectError()) {
+    final OdeAsyncCallback<UserProject> callback = new OdeAsyncCallback<UserProject>() {
       @Override
       public void onSuccess(UserProject projectInfo) {
         // This just adds the new project to the project manager, not to AppEngine
@@ -810,18 +854,22 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
      * Builds the TemplateInfo object from JSON
      * @param value
      */
-    public TemplateInfo(JSONObject value) {
-      this.name = value.get("name").toString();
-      this.name = this.name.substring(1, this.name.length() -1);
-      this.subtitle = value.get("subtitle").toString();
-      this.subtitle = this.subtitle.substring(1, this.subtitle.length() -1);
-      this.description = value.get("description").toString();
-      this.description = this.description.substring(1, this.description.length() -1);
-      this.thumbStr = value.get("thumbnail").toString();
-      this.thumbStr = this.thumbStr.substring(1, this.thumbStr.length() -1);
-      this.screenshotStr = value.get("screenshot").toString();
-      this.screenshotStr = this.screenshotStr.substring(1, this.screenshotStr.length() -1);
-    };
+      public TemplateInfo(JSONObject value) {
+      this.name = getString(value, "name");
+      this.subtitle = getString(value, "subtitle");
+      this.description = getString(value, "description");
+      this.thumbStr = getString(value, "thumbnail");
+      this.screenshotStr = getString(value, "screenshot");
+    }
+
+    private static String getString(JSONObject value, String key) {
+      if (value == null) {
+        return "";
+      }
+      JSONValue jsonValue = value.get(key);
+      JSONString string = jsonValue == null ? null : jsonValue.isString();
+      return string == null ? "" : string.stringValue();
+    }
   }
 
   /**
@@ -923,7 +971,11 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
    * @return A CellList widget
    */
   public CellList<TemplateInfo> makeTemplateSelector(ArrayList<TemplateInfo> list) {
-    TemplateCell templateCell = new TemplateCell(list.get(0), templateHostUrl);
+    if (list == null) {
+      list = new ArrayList<TemplateInfo>();
+    }
+    TemplateCell templateCell = new TemplateCell(
+        list.isEmpty() ? new TemplateInfo() : list.get(0), templateHostUrl);
 
     CellList<TemplateInfo> templateCellList = new CellList<TemplateInfo>(templateCell,TemplateInfo.KEY_PROVIDER);
     templateCellList.setPageSize(list.size() + 10);
@@ -937,7 +989,12 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
     final SingleSelectionModel<TemplateInfo> selectionModel =
       new SingleSelectionModel<TemplateInfo>(TemplateInfo.KEY_PROVIDER);
     templateCellList.setSelectionModel(selectionModel);
-    selectionModel.setSelected(list.get(0), true);
+    if (!list.isEmpty()) {
+      selectedTemplateNAME = list.get(0).name;
+      selectionModel.setSelected(list.get(0), true);
+    } else {
+      setFinishEnabled(false);
+    }
     final TemplateUploadWizard wizard = this;
     selectionModel.addSelectionChangeHandler(new SelectionChangeEvent.Handler() {
         public void onSelectionChange(SelectionChangeEvent event) {
@@ -971,6 +1028,8 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
 
     setPixelSize(width, height);
     super.setPagePanelHeight(400);
+    setFinishEnabled(builtInTemplates != null && !builtInTemplates.isEmpty()
+        && selectedTemplateNAME != null);
   }
 
   /**
@@ -994,25 +1053,32 @@ public class TemplateUploadWizard extends Wizard implements NewUrlDialogCallback
           }
           @Override
           public void onResponseReceived(Request request, Response response) {
-            if (response.getStatusCode() != Response.SC_OK) {
+            if (response == null || response.getStatusCode() != Response.SC_OK) {
               Window.alert("Unable to load Project Template Data.");
               return;
             }
 
             ArrayList<TemplateInfo> externalTemplates = new ArrayList<TemplateInfo>();
-
-            JSONValue jsonVal = JSONParser.parseLenient(response.getText());
-            JSONArray jsonArr = jsonVal.isArray();
-
-            for(int i = 0; i < jsonArr.size(); i++) {
-              JSONValue entry1 = jsonArr.get(i);
-              JSONObject entry = entry1.isObject();
-              externalTemplates.add(
-                new TemplateInfo(entry.get("name").isString().stringValue(),
-                  entry.get("subtitle").isString().stringValue(),
-                  entry.get("description").isString().stringValue(),
-                  entry.get("screenshot").isString().stringValue(),
-                  entry.get("thumbnail").isString().stringValue()));
+            try {
+              JSONValue jsonVal = JSONParser.parseLenient(response.getText());
+              JSONArray jsonArr = jsonVal == null ? null : jsonVal.isArray();
+              if (jsonArr == null) {
+                throw new IllegalArgumentException("Template manifest is not an array");
+              }
+              for (int i = 0; i < jsonArr.size(); i++) {
+                JSONObject entry = jsonArr.get(i).isObject();
+                if (entry == null || entry.get("name") == null) {
+                  continue;
+                }
+                JSONString name = entry.get("name").isString();
+                if (name == null || name.stringValue().isEmpty()) {
+                  continue;
+                }
+                externalTemplates.add(new TemplateInfo(entry));
+              }
+            } catch (Exception e) {
+              Window.alert("Unable to parse template repository data.");
+              return;
             }
             if (externalTemplates.size() == 0) {
               Window.alert("Unable to retrieve templates for host = " + hostUrl + ".");

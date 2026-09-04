@@ -8,6 +8,7 @@ package com.google.appinventor.client.editor.simple.palette;
 import com.google.appinventor.client.editor.designer.DesignerEditor;
 import com.google.appinventor.client.editor.simple.SimpleEditor;
 import com.google.appinventor.client.editor.simple.components.MockAbsoluteArrangement;
+import com.google.appinventor.client.local.LocalProjectService;
 import com.google.appinventor.client.editor.simple.components.MockBall;
 import com.google.appinventor.client.editor.simple.components.MockButton;
 import com.google.appinventor.client.editor.simple.components.MockCanvas;
@@ -250,8 +251,10 @@ public class BaseComponentFactory implements ComponentFactory {
     Image image;
     if (iconPath.startsWith("aiwebres/") && packageName != null) {
       // icon for extension
-      image = new Image(StorageUtil.getFileUrl(editor.getProjectId(),
-          "assets/external_comps/" + packageName + "/" + iconPath));
+      String iconFileId = "assets/external_comps/" + packageName + "/" + iconPath;
+      String localUrl = LocalProjectService.getLocalAssetDataUrl(editor.getProjectId(), iconFileId);
+      image = new Image(localUrl != null ? localUrl
+          : StorageUtil.getFileUrl(editor.getProjectId(), iconFileId));
       image.setWidth("16px");
       image.setHeight("16px");
     } else if (bundledImages.containsKey(iconPath)) {

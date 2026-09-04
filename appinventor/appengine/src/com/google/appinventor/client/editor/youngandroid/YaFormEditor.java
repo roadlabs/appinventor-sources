@@ -11,6 +11,7 @@ import com.google.appinventor.client.Ode;
 import com.google.appinventor.client.OdeAsyncCallback;
 import com.google.appinventor.client.boxes.PaletteBox;
 import com.google.appinventor.client.editor.ProjectEditor;
+import com.google.appinventor.client.editor.blocks.BlocksEditor;
 import com.google.appinventor.client.editor.designer.DesignerEditor;
 import com.google.appinventor.client.editor.simple.ComponentNotFoundException;
 import com.google.appinventor.client.editor.simple.SimpleComponentDatabase;
@@ -340,10 +341,25 @@ public final class YaFormEditor extends DesignerEditor<YoungAndroidFormNode, Moc
 
     // Listen to changes on the form.
     root.addDesignerChangeListener(this);
-    // Also have the blocks editor listen to changes. Do this here instead
-    // of in the blocks editor so that we don't risk it missing any updates.
-    root.addDesignerChangeListener(((YaProjectEditor) projectEditor)
-        .getBlocksFileEditor(root.getName()));
+    // Also have the blocks editor listen to changes. The form and blocks
+    // editors are created asynchronously, so the partner may not exist yet.
+    // Never register null as a listener; the form can fire refresh events
+    // immediately after loading and a null listener would abort Designer
+    // initialization.
+    BlocksEditor<?, ?> blocksEditor = ((YaProjectEditor) projectEditor)
+        .getBlocksFileEditor(root.getName());
+    if (blocksEditor != null) {
+      root.addDesignerChangeListener(blocksEditor);
+    }
+  }
+
+  /**
+   * Attaches the blocks editor after the asynchronous editor pair is complete.
+   */
+  void attachBlocksEditor(BlocksEditor<?, ?> blocksEditor) {
+    if (blocksEditor != null && root != null) {
+      root.addDesignerChangeListener(blocksEditor);
+    }
   }
 
   /**
@@ -483,7 +499,10 @@ public final class YaFormEditor extends DesignerEditor<YoungAndroidFormNode, Moc
    * Push changes to a connected phone (or emulator).
    */
   private void updatePhone() {
-    ((YaBlocksEditor) getBlocksEditor()).sendComponentData();
+    BlocksEditor<?, ?> blocksEditor = getBlocksEditor();
+    if (blocksEditor instanceof YaBlocksEditor) {
+      ((YaBlocksEditor) blocksEditor).sendComponentData();
+    }
   }
 
   @Override

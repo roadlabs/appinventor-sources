@@ -631,8 +631,43 @@ Blockly.ReplMgr.putYail = (function() {
                     return;     // We are in the process of starting
                 }
                 // OK, let's send with webrtc!
-                // First let's drain the queue of pending asset updates
-                while ((work = rs.phoneState.assetQueue.shift())) {
+                // First let's drain the queue of pending asset updates.
+                // Backpressure:大 classes.jar 编码 base64 后十几 MB,Chrome
+                // RTCDataChannel send-buffer 上限 16 MiB,不限速会撑爆 channel
+                // 关闭,final YAIL 丢失 → Companion 抛 "Extension does not
+                // exist"。每次 send 前检查 bufferedAmount,超 1 MiB 暂停并
+                // 监听 onbufferedamountlow 唤醒。
+                var DC_BUFFER_PAUSE = 1024 * 1024; // 1 MiB
+                var sendWithBackpressure = function(item) {
+                    if (webrtcdata.bufferedAmount > DC_BUFFER_PAUSE) {
+                        console.log('pollphone: webrtc backpressure, buffered=' +
+                            webrtcdata.bufferedAmount + ', pausing');
+                        webrtcdata.onbufferedamountlow = function() {
+                            webrtcdata.onbufferedamountlow = null;
+                            engine.pollphone();
+                        };
+                        return false;
+                    }
+                    console.log('Chunk: ' + item);
+                    webrtcdata.send(item);
+                    return true;
+                };
+                // Project transfers are drained before ordinary queues. The
+                // helper is declared above, so this branch cannot reference an
+                // uninitialized minified local variable.
+                if (rs.phoneState.projectQueue && rs.phoneState.projectQueue.length > 0) {
+                    while ((work = rs.phoneState.projectQueue.shift())) {
+                        if (!sendWithBackpressure(work.code)) {
+                            rs.phoneState.projectQueue.unshift(work);
+                            return;
+                        }
+                    }
+                    rs.phoneState.projectTransferActive = false;
+                    return;
+                }
+                // Keep chunk progress on the queue item itself. Local
+                // pending arrays cannot survive a backpressure return.
+                while ((work = rs.phoneState.assetQueue[0])) {
                     if (!work.block) {
                         blockid = -1;
                     } else {
@@ -641,18 +676,32 @@ Blockly.ReplMgr.putYail = (function() {
                     sendcode = "(begin (require <com.google.youngandroid.runtime>) (process-repl-input " +
                         blockid + " (begin " + work.code + ")))";
                     console.log(sendcode);
-                    // sendcode is a string of all of the scheme code
-                    sendcode = engine.chunker(sendcode);
-                    // sendcode is now an array of strings, also scheme
-                    // code, but guaranteed that each will fit in a
-                    // webrtc message
-                    sendcode.forEach(function(item) {
-                        console.log('Chunk: ' + item);
-                        webrtcdata.send(item);
-                    });
+                    if (!work._webrtcChunks) {
+                        work._webrtcChunks = engine.chunker(sendcode);
+                        work._webrtcChunkIndex = 0;
+                    }
+                    while (work._webrtcChunkIndex < work._webrtcChunks.length) {
+                        if (!sendWithBackpressure(work._webrtcChunks[work._webrtcChunkIndex])) {
+                            return;
+                        }
+                        work._webrtcChunkIndex++;
+                    }
+                    rs.phoneState.assetQueue.shift();
                 }
                 if (rs.state == Blockly.ReplMgr.rsState.CONNECTED) {
-                    while ((work = rs.phoneState.phoneQueue.shift())) {
+                    // Asset work has priority. Move phone work only after
+                    // assets are drained so loadExtensions cannot overtake a
+                    // jar transfer.
+                    while (rs.phoneState.phoneQueue.length > 0) {
+                        rs.phoneState.assetQueue.push(rs.phoneState.phoneQueue.shift());
+                    }
+                    if (!sentMacros) {
+                        if (!sendWithBackpressure(rs.android ? PROTECT_ENUM_ANDROID : PROTECT_ENUM_IOS)) {
+                            return;
+                        }
+                        sentMacros = true;
+                    }
+                    while ((work = rs.phoneState.assetQueue.shift())) {
                         if (!work.block) {
                             blockid = -1;
                         } else {
@@ -661,19 +710,15 @@ Blockly.ReplMgr.putYail = (function() {
                         sendcode = "(begin (require <com.google.youngandroid.runtime>) (process-repl-input " +
                             blockid + " (begin " + work.code + ")))";
                         console.log(sendcode);
-                        // sendcode is a string of all of the scheme code
                         sendcode = engine.chunker(sendcode);
-                        // sendcode is now an array of strings, also scheme
-                        // code, but guaranteed that each will fit in a
-                        // webrtc message
-                        if (!sentMacros) {
-                            webrtcdata.send(rs.android ? PROTECT_ENUM_ANDROID : PROTECT_ENUM_IOS);
-                            sentMacros = true;
+                        for (var pi = 0; pi < sendcode.length; pi++) {
+                            if (!sendWithBackpressure(sendcode[pi])) {
+                                // Preserve the unsent phone work by putting it
+                                // back at the front of its queue.
+                                rs.phoneState.phoneQueue.unshift(work);
+                                return;
+                            }
                         }
-                        sendcode.forEach(function(item) {
-                            console.log('Chunk: ' + item);
-                            webrtcdata.send(item);
-                        });
                     }
                 }
                 return;
@@ -1514,7 +1559,18 @@ Blockly.ReplMgr.getFromRendezvous = function() {
                                           // HTTP
                 rs.webrtc = json.webrtc === "true";
                 rs.useproxy = json.useproxy === "true";
-                rs.hasfetchassets = rs.android || rs.webrtc;
+                // Plan D (双路径方案):legacy 模式走 HTTP PUT 8001,WebRTC 模式走
+                // DataChannel YAIL(在 putAsset 中检测 usewebrtc 触发)。关闭原始的
+                // AssetFetcher:fetchAssets 路径(该路径让 Companion 去 HTTPS GET
+                // offline-webapp origin,在无 servlet 的离线部署下必然失败)。
+                rs.hasfetchassets = false;
+                if (rs.webrtc) {
+                    // WebRTC 模式:extensions 走 YAIL AssetFetcher:loadExtensions
+                    rs.extensionurl = null;
+                } else {
+                    // legacy 模式:extensions 走 HTTP POST /_extensions
+                    rs.extensionurl = rs.baseurl + '_extensions';
+                }
 
                 // Let's see if the Rendezvous server gave us a second level to contact
                 // as well as a list of ice servers to override our defaults
@@ -1743,18 +1799,10 @@ Blockly.ReplMgr.resendAssetsAndExtensions = function() {
 
 Blockly.ReplMgr.loadExtensions = function() {
     var rs = top.ReplState;
-    // Note: If hasfetchassets is false, we are on iOS which doesn't yet
-    // support extensions
-    if (rs.hasfetchassets) {
-        // Need to trigger the loading of extensions here
-        rs.state = Blockly.ReplMgr.rsState.EXTENSIONS;
-        var extensionJson = JSON.stringify(top.AssetManager_getExtensions());
-        extensionJson = AI.Yail.quotifyForREPL(extensionJson);
-        var yailstring = "(AssetFetcher:loadExtensions " +
-          extensionJson + ")";
-        console.log("Blockly.ReplMgr.loadExtensions: Yail = " + yailstring);
-        this.putYail.putAsset(yailstring);
-    } else if (rs.extensionurl) {
+    // Plan D 双路径:legacy 模式 extensionurl 已设,HTTP POST 到 /_extensions;
+    // WebRTC 模式 extensionurl 为 null,走 YAIL AssetFetcher:loadExtensions;
+    // 都不满足(无 extensions 或 iOS)直接 CONNECTED。
+    if (rs.extensionurl) {
         rs.state = Blockly.ReplMgr.rsState.EXTENSIONS;
         var xmlhttp = new XMLHttpRequest();
         var encoder = new URLSearchParams();
@@ -1773,6 +1821,17 @@ Blockly.ReplMgr.loadExtensions = function() {
             }
         };
         xmlhttp.send(encoder.toString());
+    } else if (top.usewebrtc) {
+        // WebRTC 模式:通过 DataChannel 发 YAIL AssetFetcher:loadExtensions
+        // AssetManager only marks an extension transferred after its final
+        // assetTransferred response, so this is queued after all jar writes.
+        rs.state = Blockly.ReplMgr.rsState.EXTENSIONS;
+        var extensionJson = JSON.stringify(top.AssetManager_getExtensions());
+        extensionJson = AI.Yail.quotifyForREPL(extensionJson);
+        var yailstring = "(AssetFetcher:loadExtensions " +
+          extensionJson + ")";
+        console.log("Blockly.ReplMgr.loadExtensions: Yail = " + yailstring);
+        this.putYail.putAsset(yailstring);
     } else {
         rs.state = Blockly.ReplMgr.rsState.CONNECTED;
         Blockly.common.getMainWorkspace().fireChangeListener(new AI.Events.CompanionConnect());
@@ -1873,6 +1932,123 @@ Blockly.ReplMgr.getCookie = function() {
     return cookie;
 };
 
+Blockly.ReplMgr.saveProjectArchive = function(projectName, archiveBase64, success, failure) {
+    var rs = top.ReplState;
+    if (!top.usewebrtc) {
+        return this.saveProjectArchiveLegacy(projectName, archiveBase64, success, failure);
+    }
+    if (!top.usewebrtc || !top.webrtcdata || !rs ||
+        (rs.state != this.rsState.CONNECTED && rs.state != this.rsState.ASSET)) {
+        if (failure) failure('Save Project to Companion requires WebRTC');
+        return false;
+    }
+    if (!archiveBase64 || !projectName || /[\\\\/:*?"<>|]/.test(projectName) ||
+        projectName === '.' || projectName === '..') {
+        if (failure) failure('Invalid project name or empty project archive');
+        return false;
+    }
+    var chunks = [];
+    // archiveBase64 is already a valid Base64 representation. Split only at
+    // complete 4-character Base64 quanta so each independently decoded chunk
+    // reconstructs the exact original byte sequence.
+    var size = 8000;
+    size -= size % 4;
+    for (var i = 0; i < archiveBase64.length; i += size) {
+        chunks.push(archiveBase64.substring(i, Math.min(i + size, archiveBase64.length)));
+    }
+    var escapedName = projectName.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"');
+    var queue = rs.phoneState.projectQueue || (rs.phoneState.projectQueue = []);
+    if (rs.phoneState.projectTransferActive) {
+        if (failure) failure('A project transfer is already in progress');
+        return false;
+    }
+    rs.phoneState.projectTransferActive = true;
+    var add = function(code) {
+        queue.push({code: Blockly.ReplMgr.quoteUnicode(code), projectCache: true});
+    };
+    var rootExpression = '(java.nio.file.Paths:get (string-append ' +
+        '(java.lang.String:valueOf ' +
+        '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+        '(com.google.appinventor.components.runtime.Form:getActiveForm) #t)) ' +
+        '"__projects__"))';
+    var pathExpression = '(java.nio.file.Paths:get (string-append ' +
+        '(java.lang.String:valueOf ' +
+        '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+        '(com.google.appinventor.components.runtime.Form:getActiveForm) #t)) ' +
+        '"__projects__/' + escapedName + '"))';
+    var copyExpression = '(java.nio.file.Paths:get (string-append ' +
+        '(java.lang.String:valueOf ' +
+        '(invoke (invoke (com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+        '(quote getApplicationContext)) (quote getExternalFilesDir) ' +
+        '"assets/__projects__")) ' +
+        '"/' + escapedName + '"))';
+    add('(begin (java.nio.file.Files:createDirectories ' + rootExpression + ') ' +
+        '(java.nio.file.Files:deleteIfExists ' + pathExpression + ') ' +
+        '(java.nio.file.Files:deleteIfExists ' + copyExpression + '))');
+    var decoderExpression = '(java.util.Base64:getDecoder)';
+    var outputExpression = function(path) {
+        return '(java.io.FileOutputStream:new (invoke ' + path +
+            ' (quote toFile)) #t)';
+    };
+    for (var c = 0; c < chunks.length; c++) {
+        var chunk = chunks[c];
+        var bytesExpression = '(invoke ' + decoderExpression +
+            ' (quote decode) "' + chunk + '")';
+        var firstOutput = outputExpression(pathExpression);
+        var secondOutput = outputExpression(copyExpression);
+        add('(begin (define ai-project-cache-out ' + firstOutput + ') ' +
+            '(invoke ai-project-cache-out (quote write) ' + bytesExpression + ') ' +
+            '(invoke ai-project-cache-out (quote close)) ' +
+            '(define ai-project-cache-copy-out ' + secondOutput + ') ' +
+            '(invoke ai-project-cache-copy-out (quote write) ' + bytesExpression + ') ' +
+            '(invoke ai-project-cache-copy-out (quote close)))');
+    }
+    add('(com.google.appinventor.components.runtime.RetValManager:assetTransferred ' +
+        '"assets/__projects__/' + escapedName + '"))');
+    var finalItem = queue[queue.length - 1];
+    finalItem.success = success;
+    finalItem.failure = failure;
+    setTimeout(function() {
+        Blockly.ReplMgr.putYail();
+    }, 0);
+    return true;
+};
+
+/** Upload the complete archive through Companion's legacy HTTP PUT endpoint. */
+Blockly.ReplMgr.saveProjectArchiveLegacy = function(projectName, archiveBase64, success, failure) {
+    var rs = top.ReplState;
+    if (!rs || !rs.baseurl || !archiveBase64 || !projectName) {
+        if (failure) failure('Legacy Companion connection is unavailable');
+        return false;
+    }
+    var binary;
+    try {
+        var raw = atob(archiveBase64);
+        binary = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) {
+            binary[i] = raw.charCodeAt(i);
+        }
+    } catch (err) {
+        if (failure) failure('Unable to decode project archive');
+        return false;
+    }
+    var xhr = new XMLHttpRequest();
+    var filename = '__projects__/' + projectName;
+    xhr.open('PUT', rs.baseurl + '?filename=' + encodeURIComponent(filename), true);
+    xhr.onload = function() {
+        if (xhr.status >= 200 && xhr.status < 300) {
+            if (success) success();
+        } else if (failure) {
+            failure('Companion PUT failed: ' + xhr.status);
+        }
+    };
+    xhr.onerror = function() {
+        if (failure) failure('Unable to reach Companion HTTP server');
+    };
+    xhr.send(binary);
+    return true;
+};
+
 Blockly.ReplMgr.connectCache = function(projectId, projectName) {
     if (top.ReplState === undefined)
         return false;
@@ -1894,19 +2070,179 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
         return false;
     if (!force && (top.ReplState.state != this.rsState.ASSET && top.ReplState.state != this.rsState.CONNECTED))
         return false;           // We didn't really do anything
-    if (!force && top.ReplState.hasfetchassets) {               // Force is only used for updating the emulator
-                                                         // Only android has AssetFetcher:fetchAssets working
-        // Note: We only use the passed in callback if we are updating
-        // the emulator (code below). Otherwise we just call
-        // makeAssetTransferred ourselves
+
+    // Plan D 双路径:WebRTC 模式走 DataChannel YAIL + Java 互操作写文件。
+    // kawa 顶层 define 跨 evalScheme 持久(与现有 chunker 同机制),分三阶段:
+    //   Init   — 定义 ai-target-path / ai-parent / ai-chunks / ai-expected
+    //   Chunks — 每条 (set! ai-chunks (append ai-chunks (list "<base64>")))
+    //   Final  — (apply string-append ai-chunks) → Base64 decode → Files.write → assetTransferred
+    if (!force && top.usewebrtc && top.webrtcdata) {
+        // 兼容 ArrayBuffer:LocalProjectService.getFileBytes 返回 GWT typedarray
+        // ArrayBuffer,有 byteLength 不是 length,不可下标。原生 JS 数组
+        // (AssetManager.doPutAsset 传的 byte[])走原路径。
+        if (blob instanceof ArrayBuffer) {
+            if (blob.byteLength === 0) {
+                console.log("putAsset: empty ArrayBuffer, skip " + filename);
+                if (fail) fail();
+                return false;
+            }
+            blob = new Uint8Array(blob, 0, blob.byteLength);
+        }
+        var base64;
+        try {
+            var bytes = new Uint8Array(blob.length);
+            for (var bi = 0; bi < blob.length; bi++) bytes[bi] = blob[bi];
+            // 分片 btoa 避免大数组 apply 爆栈
+            var BASE64_CHUNK = 0x8000;
+            var parts = [];
+            for (var bi2 = 0; bi2 < bytes.length; bi2 += BASE64_CHUNK) {
+                parts.push(btoa(String.fromCharCode.apply(null, bytes.subarray(bi2, bi2 + BASE64_CHUNK))));
+            }
+            base64 = parts.join('');
+        } catch (e) {
+            console.log("putAsset: base64 encode failed: " + e);
+            if (fail) fail();
+            return false;
+        }
+        var STR_CHUNK = 12000;
+        // Normalize project-relative paths. AssetManager normally supplies
+        // assets/<path>, but local/offline callers may omit the assets prefix.
+        var shortFn = filename;
+        if (shortFn.indexOf('assets/') === 0) {
+            shortFn = shortFn.substring('assets/'.length);
+        }
+        // extension 路径双写:Android 14+ 走 cacheDir + external_comps/<pkg>/<pkg>.jar,
+        // Android <14 走 replAssetDir + external_comps/<pkg>/classes.jar。
+        // ReplForm.loadComponents (ReplForm.java:505-506) 按 SDK 版本挑文件名:
+        //   SDK ≥ 34: <pkg>.jar,SDK < 34: classes.jar。
+        // YAIL 不知道设备 SDK,所以 init 时同时定义两个 base path + 两个 target path,
+        // final 时把字节写两个位置。冗余安全,Android 14+ 上 replAssetDir/external_comps
+        // 目录存在但 loadComponents 不看(它看 cacheDir),所以不会被误用。
+        var isExt = shortFn.indexOf('external_comps/') === 0;
+        var target1Path, target2Path, aiBase1Expr, aiBase2Expr;
+        if (isExt) {
+            // shortFn = "external_comps/<pkg>/classes.jar"
+            // rest 剥 external_comps/ → "<pkg>/classes.jar"
+            var rest = shortFn.substring('external_comps/'.length);
+            // target1:replAssetDir(以 / 结尾) + external_comps/<pkg>/classes.jar
+            //        = /.../assets/external_comps/<pkg>/classes.jar (Android <14)
+            //        注意:replAssetDir 已经以 / 结尾,但 shortFn 不带前导 /,所以
+            //        拼起来是 .../assets/ + external_comps/.../classes.jar,正确。
+            target1Path = rest;
+            // target2:cacheDir + "/external_comps/" + rest  (但 classes.jar → <pkg>.jar)
+            if (rest.endsWith('/classes.jar')) {
+                var pkgName = rest.substring(0, rest.length - '/classes.jar'.length);
+                target2Path = pkgName + '/' + pkgName + '.jar';
+            } else {
+                target2Path = rest;
+            }
+            // base1:replAssetDir(以 / 结尾),需要外面不再 prepend 任何东西
+            // base2:cacheDir(无尾 /),需要外面 prepend "/external_comps/" + target2
+        }
+        var chunks = [];
+        for (var ci = 0; ci < base64.length; ci += STR_CHUNK) {
+            chunks.push(base64.slice(ci, ci + STR_CHUNK));
+        }
+        this.putYail();  // 设置 putYail 闭包内的 context
+        // Init — 避免 kawa 把 .to 当 Java 包名,改用 invoke 实例方法 + 字符串拼接
+        var initYail;
+        if (isExt) {
+            initYail = '(begin ' +
+                '(define ai-base1-str ' +
+                    '(invoke (com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+                        '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                        '#t) (quote toString))) ' +
+                '(define ai-base2-str ' +
+                    '(string-append ' +
+                        '(invoke (invoke (com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                            '(quote getCacheDir)) (quote getAbsolutePath)) ' +
+                        '"/external_comps/")) ' +
+                '(define ai-target1-path ' +
+                    '(java.nio.file.Paths:get ' +
+                        '(java.io.File:new (string-append ai-base1-str "external_comps/' + target1Path + '")))) ' +
+                '(define ai-target2-path ' +
+                    '(java.nio.file.Paths:get ' +
+                        '(java.io.File:new (string-append ai-base2-str "' + target2Path + '")))) ' +
+                '(java.nio.file.Files:createDirectories ' +
+                    '(java.nio.file.Paths:get (invoke ai-target1-path (quote getParent)))) ' +
+                '(java.nio.file.Files:createDirectories ' +
+                    '(java.nio.file.Paths:get (invoke ai-target2-path (quote getParent)))) ' +
+                '(define ai-chunks (quote ())) ' +
+                '(define ai-expected ' + chunks.length + '))';
+        } else {
+            initYail = '(begin ' +
+                '(define ai-base-str ' +
+                    '(java.lang.String:valueOf ' +
+                        '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+                            '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                        '#t))) ' +
+                '(define ai-base-path ' +
+                    '(java.nio.file.Paths:get ' +
+                        '(java.io.File:new ai-base-str))) ' +
+                '(java.nio.file.Files:createDirectories ai-base-path) ' +
+                '(define ai-target-path ' +
+                    '(java.nio.file.Paths:get ' +
+                        '(java.io.File:new (string-append ai-base-str "' + shortFn + '")))) ' +
+                '(define ai-chunks (quote ())) ' +
+                '(define ai-expected ' + chunks.length + '))';
+        }
+        this.putYail.putAsset(initYail);
+        // Chunks
+        for (var cj = 0; cj < chunks.length; cj++) {
+            this.putYail.putAsset(
+                '(set! ai-chunks (append ai-chunks (list "' + chunks[cj] + '")))');
+        }
+        // Final — extension 双写(target1: classes.jar, target2: <pkg>.jar),
+        // 普通 asset 单写。try-catch 兜底:Android 14+ 上 replAssetDir 可能只读,
+        // 失败不阻断 cacheDir 写入。kawa 形式:
+        //   (try-catch body (ex Type handler)),handler 是 (var Type body)
+        var finalYail;
+        if (isExt) {
+            finalYail = '(begin ' +
+                '(define ai-bytes ' +
+                    '(invoke (java.util.Base64:getDecoder) (quote decode) ' +
+                        '(apply string-append ai-chunks))) ' +
+                // Try both locations because the Companion chooses the
+                // location from the Android API level. Completion must only
+                // be reported after at least one write succeeds.
+                '(define ai-written #f) ' +
+                '(try-catch ' +
+                    '(begin (java.nio.file.Files:write ai-target1-path ai-bytes) ' +
+                        '(set! ai-written #t)) ' +
+                    '(ex java.lang.Throwable #f)) ' +
+                '(try-catch ' +
+                    '(begin (java.nio.file.Files:write ai-target2-path ai-bytes) ' +
+                        '(set! ai-written #t)) ' +
+                    '(ex java.lang.Throwable #f)) ' +
+                '(if ai-written ' +
+                    '(begin (set! ai-chunks (quote ())) ' +
+                        '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '")) ' +
+                    '(error "Unable to write extension jar")))';
+        } else {
+            finalYail = '(begin ' +
+                '(define ai-bytes ' +
+                    '(invoke (java.util.Base64:getDecoder) (quote decode) ' +
+                        '(apply string-append ai-chunks))) ' +
+                '(try-catch ' +
+                    '(java.nio.file.Files:write ai-target-path ai-bytes) ' +
+                    '(ex java.lang.Throwable #t)) ' +
+                '(set! ai-chunks (quote ())) ' +
+                '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '"))';
+        }
+        this.putYail.putAsset(finalYail);
+        if (success) success();
+        return true;
+    }
+
+    // 旧路径(force=true 或 usewebrtc=false 但 hasfetchassets 仍为 true 的边缘情况,例如通过 triggerUpdate 升级 Companion)
+    if (!force && top.ReplState.hasfetchassets) {
         var uri = window.location.origin;
         var cookie = this.getCookie();
         console.log("putAsset uri = " + uri + " cookie = " + cookie);
         var yail = "(AssetFetcher:fetchAssets \"" + cookie + "\" \"" + projectid +
             "\" \"" + uri + "\" \"" + filename + "\")";
         console.log("Yail for putAsset = " + yail);
-        this.putYail();         // This sets up the internal context variable
-                                // inside of the Closure for putYail and friends
+        this.putYail();
         this.putYail.putAsset(yail);
         return true;
     }
@@ -1946,8 +2282,7 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                     this.retries--;
                     this.open('PUT', rs.baseurl + '?' + encoder.toString(), true);
                     this.send(arraybuf);
-                }
-                if (fail) {
+                } else if (fail) {
                     fail();
                 }
             }

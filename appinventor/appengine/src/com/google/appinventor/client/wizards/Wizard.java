@@ -313,6 +313,11 @@ public abstract class Wizard extends DialogBox {
     okButton.setEnabled(true);
   }
 
+  /** Enables or disables the finish button for the current wizard page. */
+  protected void setFinishEnabled(boolean enabled) {
+    okButton.setEnabled(enabled);
+  }
+
   protected HorizontalPanel getButtonPanel() {
     return buttonPanel;
   }

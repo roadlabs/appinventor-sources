@@ -63,6 +63,7 @@
   <source path="client/explorer/commands"/>
   <source path="client/explorer/project"/>
   <source path="client/explorer/youngandroid"/>
+  <source path="client/local"/>
   <source path="client/properties/json"/>
   <source path="client/settings/project"/>
   <source path="client/settings/user"/>
@@ -181,7 +182,7 @@
   </replace-with>
 
   <replace-with class="com.google.appinventor.client.local.LocalTokenAuthService">
-    <when-type-is class="com.google.appinventor.shared.rpc.user.TokenAuthService"/>
+    <when-type-is class="com.google.appinventor.shared.rpc.tokenauth.TokenAuthService"/>
     <when-property-is name="local.services" value="true"/>
   </replace-with>
 
@@ -192,6 +193,12 @@
 
   <replace-with class="com.google.appinventor.client.local.LocalUploader">
     <when-type-is class="com.google.appinventor.client.utils.Uploader"/>
+    <when-property-is name="local.services" value="true"/>
+  </replace-with>
+
+  <!-- offline-webapp-patched: component-service-binding -->
+  <replace-with class="com.google.appinventor.client.local.LocalComponentService">
+    <when-type-is class="com.google.appinventor.shared.rpc.component.ComponentService"/>
     <when-property-is name="local.services" value="true"/>
   </replace-with>
 </module>

@@ -8,6 +8,7 @@ package com.google.appinventor.client.editor.youngandroid.properties;
 import com.google.appinventor.client.Ode;
 import com.google.appinventor.client.editor.simple.SimpleEditor;
 import com.google.appinventor.client.explorer.project.Project;
+import com.google.appinventor.client.local.LocalProjectService;
 import com.google.appinventor.client.widgets.properties.PropertyEditor;
 import com.google.appinventor.client.wizards.MarkOriginWizard;
 import com.google.appinventor.shared.rpc.project.HasAssetsFolder;
@@ -58,6 +59,12 @@ public class YoungAndroidSpriteOriginPropertyEditor extends PropertyEditor {
     if (!text.isEmpty()) {
       ProjectNode asset = getAssetNode(text);
       if (asset != null) {
+        // Offline mode: embed the image from IndexedDB as a data: URL.
+        String localUrl = LocalProjectService.getLocalAssetDataUrl(asset.getProjectId(),
+            asset.getFileId());
+        if (localUrl != null) {
+          return localUrl;
+        }
         return StorageUtil.getFileUrl(asset.getProjectId(), asset.getFileId());
       }
     }

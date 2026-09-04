@@ -249,6 +249,10 @@ public final class YaProjectEditor extends ProjectEditor implements ProjectChang
 
   public void addBlocksEditor(BlocksEditor<?, ?> editor) {
     String formName = editor.getEntityName();
+    EditorSet editors = editorMap.get(formName);
+    if (editors != null && editors.formEditor instanceof YaFormEditor) {
+      ((YaFormEditor) editors.formEditor).attachBlocksEditor(editor);
+    }
     int pos = Collections.binarySearch(fileIds, editor.getFileId(),
         getFileIdComparator());
     if (pos < 0) {

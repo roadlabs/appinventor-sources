@@ -26,9 +26,8 @@ top.HTML5DragDrop_confirmOverwriteKey = function(callback) {};
 top.HTML5DragDrop_getNewProjectName = function(filename, callback) {};
 top.HTML5DragDrop_confirmOverwriteAsset = function(projectId, name, callback) {};
 top.HTML5DragDrop_checkProjectNameForCollision = function(name) {};
-top.HTML5DragDrop_shouldShowDropTarget = function(target) {};
+top.HTML5DragDrop_shouldShowDropTarget = function(target) {};    top.HTML5DragDrop_importProject = importProject;
 
-top.HTML5DragDrop_importProject = importProject;
 
 var dropdiv = document.createElement('div');
 dropdiv.className = 'dropdiv';
@@ -91,6 +90,12 @@ function importProject(droppedItem) {
   filename = filename.substring(filename.lastIndexOf('/') + 1);
   var projectName = filename.substring(0, filename.length - 4);
   function doUploadProject(blob) {
+    // Offline / local-services build: the static webapp has no UploadServlet.
+    if (top.HTML5DragDrop_isLocalMode && top.HTML5DragDrop_isLocalMode()
+        && top.HTML5DragDrop_importProjectLocal) {
+      top.HTML5DragDrop_importProjectLocal(projectName, blob);
+      return;
+    }
     // Upload project
     var xhr = new XMLHttpRequest();
     var formData = new FormData();
@@ -126,6 +131,15 @@ function uploadExtension(droppedItem) {
   }
   function doUploadExtension(blob) {
     var projectId = top.HTML5DragDrop_getOpenProjectId();
+
+    // Offline / local-services build: bypass XHR, hand the blob straight to Java
+    // which unzips it client-side via JSZip and imports it into the project.
+    if (top.HTML5DragDrop_isLocalMode && top.HTML5DragDrop_isLocalMode()
+        && top.HTML5DragDrop_uploadExtensionLocal) {
+      top.HTML5DragDrop_uploadExtensionLocal(projectId, blob);
+      return;
+    }
+
     var xhr = new XMLHttpRequest();
     var formData = new FormData();
     formData.append('uploadComponentArchive', blob);
@@ -151,6 +165,12 @@ function uploadAsset(droppedItem) {
   }
   var projectId = top.HTML5DragDrop_getOpenProjectId();
   function doUploadAsset(blob) {
+    // Offline / local-services build: bypass XHR, hand the blob straight to Java.
+    if (top.HTML5DragDrop_isLocalMode && top.HTML5DragDrop_isLocalMode()
+        && top.HTML5DragDrop_uploadAssetLocal) {
+      top.HTML5DragDrop_uploadAssetLocal(projectId, blob);
+      return;
+    }
     var xhr = new XMLHttpRequest();
     var formData = new FormData();
     formData.append('uploadFile', blob);
@@ -175,6 +195,11 @@ function uploadAsset(droppedItem) {
 
 function uploadKeystore(droppedItem) {
   function doUploadKeystore(blob) {
+    if (top.HTML5DragDrop_isLocalMode && top.HTML5DragDrop_isLocalMode()
+        && top.HTML5DragDrop_uploadKeystoreLocal) {
+      top.HTML5DragDrop_uploadKeystoreLocal(blob);
+      return;
+    }
     var xhr = new XMLHttpRequest();
     var formData = new FormData();
     formData.append('uploadUserFile', blob);

@@ -8,6 +8,7 @@ package com.google.appinventor.client.editor.simple.components;
 
 import com.google.appinventor.client.Ode;
 import com.google.appinventor.client.editor.simple.SimpleEditor;
+import com.google.appinventor.client.local.LocalProjectService;
 import com.google.appinventor.client.explorer.project.Project;
 import com.google.appinventor.client.utils.Color;
 import com.google.appinventor.shared.rpc.project.HasAssetsFolder;
@@ -214,6 +215,14 @@ public final class MockComponentsUtil {
     if (text.length() > 0) {
       ProjectNode asset = getAssetNode(editor, text);
       if (asset != null) {
+        // Offline mode: embed the font from IndexedDB as a data: URL (the
+        // server endpoint does not exist). Falls back to the server URL on
+        // the regular build.
+        String localUrl = LocalProjectService.getLocalAssetDataUrl(asset.getProjectId(),
+            asset.getFileId());
+        if (localUrl != null) {
+          return localUrl;
+        }
         return StorageUtil.getFileUrl(asset.getProjectId(), asset.getFileId());
       }
     }

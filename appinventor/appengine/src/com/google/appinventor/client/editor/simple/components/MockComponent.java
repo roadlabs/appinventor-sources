@@ -20,6 +20,7 @@ import com.google.appinventor.client.editor.simple.components.utils.PropertiesUt
 import com.google.appinventor.client.editor.youngandroid.YaFormEditor;
 import com.google.appinventor.client.explorer.SourceStructureExplorerItem;
 import com.google.appinventor.client.explorer.project.Project;
+import com.google.appinventor.client.local.LocalProjectService;
 import com.google.appinventor.client.widgets.ClonedWidget;
 import com.google.appinventor.client.widgets.LabeledTextBox;
 import com.google.appinventor.client.widgets.dnd.DragSource;
@@ -939,6 +940,14 @@ public abstract class MockComponent extends Composite implements PropertyChangeL
     if (text.length() > 0) {
       ProjectNode asset = getAssetNode(text);
       if (asset != null) {
+        // In offline mode the server endpoint does not exist; render assets
+        // directly from IndexedDB as data: URLs. Falls back to the server URL
+        // when running the regular (online) build.
+        String localUrl = LocalProjectService.getLocalAssetDataUrl(asset.getProjectId(),
+            asset.getFileId());
+        if (localUrl != null) {
+          return localUrl;
+        }
         return StorageUtil.getFileUrl(asset.getProjectId(), asset.getFileId());
       }
     }
