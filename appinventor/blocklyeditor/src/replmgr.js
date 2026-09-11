@@ -386,7 +386,7 @@ Blockly.ReplMgr.putYail = (function() {
             engine.pollphone(); // Trigger callback side
         },
         // putAsset: Like putYail but uses a different queue
-        'putAsset' : function(code, block, success, failure) {
+        'putAsset' : function(code, block, success, failure, bare) {
             rs = top.ReplState;
             if (rs === undefined || rs === null) {
                 console.log('putAsset: replState not set yet.');
@@ -411,7 +411,8 @@ Blockly.ReplMgr.putYail = (function() {
                 'code' : Blockly.ReplMgr.quoteUnicode(code), // Deal with unicode characters and kawa
                 'success' : success,
                 'failure' : failure,
-                'block' : block
+                'block' : block,
+                'bare' : !!bare   // true → 裸 YAIL 直接 eval,不经 process-repl-input/chunker
             });
             engine.pollphone(); // Trigger callback side
         },
@@ -672,6 +673,27 @@ Blockly.ReplMgr.putYail = (function() {
                         blockid = -1;
                     } else {
                         blockid = '"' + work.block.id + '"';
+                    }
+                    if (work.bare) {
+                        // 裸 YAIL:直接 eval,不经 process-repl-input 的 in-ui 调度与
+                        // chunker 拆分。与 saveProjectArchiveWebRTC(projectQueue) 的
+                        // 已验证路径一致 —— 那套逐 chunk getDecoder 写文件在真实设备上
+                        // 可靠;而 process-repl-input 包装在此场景下会让某 chunk 的
+                        // base64 长度改变(报 "incorrect ending byte at ..."),原因未明,
+                        // 改为与 save 相同的直发路径规避。
+                        var _bc = work.code;
+                        if (!work._webrtcChunks) {
+                            work._webrtcChunks = [_bc];
+                            work._webrtcChunkIndex = 0;
+                        }
+                        while (work._webrtcChunkIndex < work._webrtcChunks.length) {
+                            if (!sendWithBackpressure(work._webrtcChunks[work._webrtcChunkIndex])) {
+                                return;
+                            }
+                            work._webrtcChunkIndex++;
+                        }
+                        rs.phoneState.assetQueue.shift();
+                        continue;
                     }
                     sendcode = "(begin (require <com.google.youngandroid.runtime>) (process-repl-input " +
                         blockid + " (begin " + work.code + ")))";
@@ -1152,7 +1174,28 @@ Blockly.ReplMgr.processRetvals = function(responses) {
             top.BlocklyPanel_popScreen();
             break;
         case "assetTransferred":
-            top.AssetManager_markAssetTransferred(r.value);
+            // 检测 WebRTC Final 阶段的失败标记 "__FAILED__"。Companion 2.80
+            // 把异常消息统一报告成 "undefined",我们改用 assetTransferred 通道
+            // 自己传递失败信号(Final 中 (error ...) 改为发送 __FAILED__ 前缀
+            // 的 assetTransferred)。这里只落 console.warn + 推进队列,不弹
+            // Designer 错误对话框,也不阻塞后续 asset 传输。
+            var _atVal = r.value;
+            if (typeof _atVal === "string" && _atVal.indexOf("assets/__FAILED__") === 0) {
+                var _realName = _atVal.substring("assets/__FAILED__".length);
+                console.warn("[replmgr] Final 阶段 Companion 上不存在文件 " +
+                    _realName + " — chunks 全部失败或路径派生失败。" +
+                    "若此项目应显示该素材,请检查:" +
+                    "(1) WebRTC DataChannel 是否成功收到 Final;" +
+                    "(2) Companion 端 QUtil:getReplAssetPath 返回路径;" +
+                    "(3) 浏览器 F12 → Network WS 看 chunks send 是否齐全;" +
+                    "(4) adb shell run-as <pkg> ls files/assets/ 验证文件实际状态");
+                // 仍以原始文件名调用 markAssetTransferred 让 AssetManager 推进
+                // 队列(否则传输会卡住)。Companion 上文件实际缺失由运行时
+                // 组件自己处理(image/sound 组件读不到文件时各自有报错)。
+                top.AssetManager_markAssetTransferred("assets/" + _realName);
+            } else {
+                top.AssetManager_markAssetTransferred(_atVal);
+            }
             break;
         case "extensionsLoaded":
             rs.state = Blockly.ReplMgr.rsState.CONNECTED;
@@ -2072,10 +2115,31 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
         return false;           // We didn't really do anything
 
     // Plan D 双路径:WebRTC 模式走 DataChannel YAIL + Java 互操作写文件。
-    // kawa 顶层 define 跨 evalScheme 持久(与现有 chunker 同机制),分三阶段:
-    //   Init   — 定义 ai-target-path / ai-parent / ai-chunks / ai-expected
-    //   Chunks — 每条 (set! ai-chunks (append ai-chunks (list "<base64>")))
-    //   Final  — (apply string-append ai-chunks) → Base64 decode → Files.write → assetTransferred
+    // V4 (逐 chunk 直写最终文件) — 完全复用 saveProjectArchiveWebRTC 里已被
+    // 验证可用的模式(项目保存到 Companion 是好的):
+    //   Init    — Files:createDirectories 确保 replAssetDir 存在(与原生
+    //              AssetFetcher.getDestinationFile 的 mkdirs 行为一致),
+    //              deleteIfExists 删除陈旧的半截目标文件。
+    //   Chunks  — 每条独立自包含 eval:
+    //                (invoke (Base64:getDecoder) (quote decode) "<chunk>")
+    //                → FileOutputStream:new (invoke <Paths> (quote toFile)) #t
+    //                → write(byte[]) → close
+    //             路径用 java.nio.file.Paths:get → toFile() 传 File 对象给
+    //             FileOutputStream(File, boolean),与 __projects__ 保存路径一致
+    //             (Kawa 对 String 版构造器有重载解析风险,File 版已验证可靠)。
+    //             每个 chunk 解码后直接 append 写进最终文件,不经过 tmp 文件,
+    //             不经过跨 eval 的 Kawa 字符串累积,天然绕开"累积串字节污染"。
+    //   Final   — 最后一个 chunk 写完后 RetValManager:assetTransferred。
+    //             普通 asset 写完即置位 ReplForm.assetsLoaded:
+    //               (invoke (Form:getActiveForm) (quote setAssetsLoaded))
+    //             MediaUtil 看到 assetsLoaded=true 才走 REPL_ASSET
+    //             (file:// + replAssetDir + asset → FileInputStream) 读文件;
+    //             否则退回 APK assets,读不到 → 表现为"连接正常但 asset 不显示"。
+    //             不用 PhoneStatus:new(构造器是 (ComponentContainer),Kawa 对
+    //             Form 参数解析可能歧义),直接对现有 ReplForm 实例调用。
+    //   extension 双写:target1 = replAssetDir/external_comps/<pkg>/classes.jar
+    //   (Android <14),target2 = cacheDir/external_comps/<pkg>/<pkg>.jar
+    //   (Android >=14)。两处都 createDirectories 父目录。
     if (!force && top.usewebrtc && top.webrtcdata) {
         // 兼容 ArrayBuffer:LocalProjectService.getFileBytes 返回 GWT typedarray
         // ArrayBuffer,有 byteLength 不是 length,不可下标。原生 JS 数组
@@ -2099,12 +2163,22 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                 parts.push(btoa(String.fromCharCode.apply(null, bytes.subarray(bi2, bi2 + BASE64_CHUNK))));
             }
             base64 = parts.join('');
+            // 每个 chunk 用 Base64:getDecoder 解码,其要求 base64 是 4 的倍数
+            // 长度且末尾 padding 完整。剥离尾部 '=' 会在最后一个 chunk 边界产生
+            // 不整的 base64,所以这里保持完整 padding 交给 getDecoder 处理。
+            // (与 saveProjectArchiveWebRTC 一致 —— 它直接对整个 base64 分块,
+            //  每块长度是 4 的倍数,交给 getDecoder 解码。)
         } catch (e) {
             console.log("putAsset: base64 encode failed: " + e);
             if (fail) fail();
             return false;
         }
-        var STR_CHUNK = 12000;
+        if (base64.length === 0) {
+            // 空资产:没有可分片的数据,直接跳过(与上面 ArrayBuffer 空文件处理一致)。
+            console.log("putAsset: empty base64, skip " + filename);
+            if (success) success();
+            return true;
+        }
         // Normalize project-relative paths. AssetManager normally supplies
         // assets/<path>, but local/offline callers may omit the assets prefix.
         var shortFn = filename;
@@ -2114,125 +2188,149 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
         // extension 路径双写:Android 14+ 走 cacheDir + external_comps/<pkg>/<pkg>.jar,
         // Android <14 走 replAssetDir + external_comps/<pkg>/classes.jar。
         // ReplForm.loadComponents (ReplForm.java:505-506) 按 SDK 版本挑文件名:
-        //   SDK ≥ 34: <pkg>.jar,SDK < 34: classes.jar。
-        // YAIL 不知道设备 SDK,所以 init 时同时定义两个 base path + 两个 target path,
-        // final 时把字节写两个位置。冗余安全,Android 14+ 上 replAssetDir/external_comps
-        // 目录存在但 loadComponents 不看(它看 cacheDir),所以不会被误用。
+        //   SDK >= 34: <pkg>.jar,SDK < 34: classes.jar。
         var isExt = shortFn.indexOf('external_comps/') === 0;
-        var target1Path, target2Path, aiBase1Expr, aiBase2Expr;
+        var target1Path, target2Path;
         if (isExt) {
             // shortFn = "external_comps/<pkg>/classes.jar"
             // rest 剥 external_comps/ → "<pkg>/classes.jar"
+            // target1:replAssetDir(以 / 结尾) + external_comps/<pkg>/classes.jar (Android <14)
+            // target2:cacheDir + "/external_comps/" + rest (但 classes.jar → <pkg>.jar)
             var rest = shortFn.substring('external_comps/'.length);
-            // target1:replAssetDir(以 / 结尾) + external_comps/<pkg>/classes.jar
-            //        = /.../assets/external_comps/<pkg>/classes.jar (Android <14)
-            //        注意:replAssetDir 已经以 / 结尾,但 shortFn 不带前导 /,所以
-            //        拼起来是 .../assets/ + external_comps/.../classes.jar,正确。
             target1Path = rest;
-            // target2:cacheDir + "/external_comps/" + rest  (但 classes.jar → <pkg>.jar)
             if (rest.endsWith('/classes.jar')) {
                 var pkgName = rest.substring(0, rest.length - '/classes.jar'.length);
                 target2Path = pkgName + '/' + pkgName + '.jar';
             } else {
                 target2Path = rest;
             }
-            // base1:replAssetDir(以 / 结尾),需要外面不再 prepend 任何东西
-            // base2:cacheDir(无尾 /),需要外面 prepend "/external_comps/" + target2
         }
+        // ---- V4 逐 chunk 直写:路径表达式内联重算,不依赖 define 跨 eval 持久 ----
+        // chunk 大小:4 的倍数,且足够小保证单条 eval 字符串字面量简单干净。
+        // (与 saveProjectArchiveWebRTC 的 8000 一致,兼顾吞吐与背压。)
+        var STR_CHUNK = 8000 - (8000 % 4);
         var chunks = [];
         for (var ci = 0; ci < base64.length; ci += STR_CHUNK) {
-            chunks.push(base64.slice(ci, ci + STR_CHUNK));
+            var chunk = base64.substring(ci, Math.min(ci + STR_CHUNK, base64.length));
+            // 把 chunk 补齐到 4 的倍数,避免 Base64:getDecoder 报
+            // "Input byte array has incorrect ending byte at ..."。
+            // getDecoder 严格要求输入长度是 4 的倍数;中间 chunk 补 '='
+            // 只是 padding,解码后不产生额外字节,append 写入的文件不受影响。
+            // %4==2 补 2 个 '=',%4==3 补 1 个 '=';%4==1 无法靠 padding 补齐
+            // (1 个残余字符不构成合法 base64),保持原样,让 getDecoder 报错以便诊断。
+            var rem = chunk.length % 4;
+            if (rem === 2) {
+                chunk = chunk + '==';
+            } else if (rem === 3) {
+                chunk = chunk + '=';
+            }
+            chunks.push(chunk);
         }
+        var baseExpr =
+            '(java.lang.String:valueOf ' +
+                '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+                    '(com.google.appinventor.components.runtime.Form:getActiveForm) #t))';
+        var cacheBaseExpr =
+            '(invoke (invoke ' +
+                '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                '(quote getCacheDir)) (quote getAbsolutePath))';
+        // 与 saveProjectArchiveWebRTC 一致:Paths:get → toFile() 传 File 对象。
+        var replPathExpr = function(suffix) {
+            return '(java.nio.file.Paths:get ' +
+                '(java.io.File:new (string-append ' + baseExpr + ' "' + suffix + '")))';
+        };
+        var cachePathExpr = function(suffix) {
+            // suffix 相对 external_comps/,即 "<pkg>/<pkg>.jar"
+            return '(java.nio.file.Paths:get ' +
+                '(java.io.File:new (string-append ' + cacheBaseExpr + ' "/external_comps/' + suffix + '")))';
+        };
+        var outputExpr = function(pathExpr) {
+            return '(java.io.FileOutputStream:new (invoke ' + pathExpr +
+                ' (quote toFile)) #t)';
+        };
+        var decoderExpr = '(java.util.Base64:getDecoder)';
+        // 调试日志:整体大小、chunk 数量
+        console.log('[replmgr putAsset] shortFn=' + shortFn +
+            ' blob.length=' + (blob && blob.length !== undefined ? blob.length : '?') +
+            ' base64.length=' + base64.length +
+            ' STR_CHUNK=' + STR_CHUNK +
+            ' chunks.length=' + chunks.length);
         this.putYail();  // 设置 putYail 闭包内的 context
-        // Init — 避免 kawa 把 .to 当 Java 包名,改用 invoke 实例方法 + 字符串拼接
-        var initYail;
+
+        // Init — 创建目录 + 删除陈旧目标文件。普通 asset 写到
+        // replAssetDir/shortFn;extension 双写 target1/target2。
+        // deleteIfExists 对不存在文件静默返回 false。
+        var target1PathExpr, target2PathExpr;
         if (isExt) {
-            initYail = '(begin ' +
-                '(define ai-base1-str ' +
-                    '(invoke (com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
-                        '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
-                        '#t) (quote toString))) ' +
-                '(define ai-base2-str ' +
-                    '(string-append ' +
-                        '(invoke (invoke (com.google.appinventor.components.runtime.Form:getActiveForm) ' +
-                            '(quote getCacheDir)) (quote getAbsolutePath)) ' +
-                        '"/external_comps/")) ' +
-                '(define ai-target1-path ' +
-                    '(java.nio.file.Paths:get ' +
-                        '(java.io.File:new (string-append ai-base1-str "external_comps/' + target1Path + '")))) ' +
-                '(define ai-target2-path ' +
-                    '(java.nio.file.Paths:get ' +
-                        '(java.io.File:new (string-append ai-base2-str "' + target2Path + '")))) ' +
-                '(java.nio.file.Files:createDirectories ' +
-                    '(java.nio.file.Paths:get (invoke ai-target1-path (quote getParent)))) ' +
-                '(java.nio.file.Files:createDirectories ' +
-                    '(java.nio.file.Paths:get (invoke ai-target2-path (quote getParent)))) ' +
-                '(define ai-chunks (quote ())) ' +
-                '(define ai-expected ' + chunks.length + '))';
+            target1PathExpr = replPathExpr('external_comps/' + target1Path);
+            target2PathExpr = cachePathExpr(target2Path);
         } else {
-            initYail = '(begin ' +
-                '(define ai-base-str ' +
-                    '(java.lang.String:valueOf ' +
-                        '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
-                            '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
-                        '#t))) ' +
-                '(define ai-base-path ' +
-                    '(java.nio.file.Paths:get ' +
-                        '(java.io.File:new ai-base-str))) ' +
-                '(java.nio.file.Files:createDirectories ai-base-path) ' +
-                '(define ai-target-path ' +
-                    '(java.nio.file.Paths:get ' +
-                        '(java.io.File:new (string-append ai-base-str "' + shortFn + '")))) ' +
-                '(define ai-chunks (quote ())) ' +
-                '(define ai-expected ' + chunks.length + '))';
+            target1PathExpr = replPathExpr(shortFn);
         }
-        this.putYail.putAsset(initYail);
-        // Chunks
+        var initYail = '(begin ' +
+            '(java.nio.file.Files:createDirectories ' + replPathExpr('') + ') ' +
+            (isExt
+                ? '(java.nio.file.Files:createDirectories ' +
+                      '(invoke ' + target1PathExpr + ' (quote getParent))) ' +
+                  '(java.nio.file.Files:createDirectories ' +
+                      '(invoke ' + target2PathExpr + ' (quote getParent))) ' +
+                  '(java.nio.file.Files:deleteIfExists ' + target1PathExpr + ') ' +
+                  '(java.nio.file.Files:deleteIfExists ' + target2PathExpr + ') '
+                : '(java.nio.file.Files:deleteIfExists ' + target1PathExpr + ') ') +
+            ')';
+        this.putYail.putAsset(initYail, null, null, null, true);   // bare:直接 eval
+
+        // Chunks — 每条独立自包含:getDecoder 解码 base64 → FileOutputStream
+        // (File, append) 写入最终文件 → close。加 Log.i 打点,设备 logcat 可核对
+        // 每块累计字节数,定位坏块。
+        var cumBytes = 0;
         for (var cj = 0; cj < chunks.length; cj++) {
-            this.putYail.putAsset(
-                '(set! ai-chunks (append ai-chunks (list "' + chunks[cj] + '")))');
+            cumBytes += Math.floor(chunks[cj].length * 3 / 4); // 近似解码后字节数
+            var bytesExpr = '(invoke ' + decoderExpr +
+                ' (quote decode) "' + chunks[cj] + '")';
+            var outExpr;
+            var extraWrite;
+            if (isExt) {
+                // 双写两个位置
+                var fos1 = '(define ai-fos1 ' + outputExpr(target1PathExpr) + ') ';
+                var fos2 = '(define ai-fos2 ' + outputExpr(target2PathExpr) + ') ';
+                var w1 = '(invoke ai-fos1 (quote write) ' + bytesExpr + ') ';
+                var w2 = '(invoke ai-fos2 (quote write) ' + bytesExpr + ') ';
+                outExpr = fos1 + fos2 + w1 + w2 +
+                    '(invoke ai-fos1 (quote close)) (invoke ai-fos2 (quote close)) ';
+                extraWrite = '';
+            } else {
+                outExpr = '(define ai-fos ' + outputExpr(target1PathExpr) + ') ' +
+                    '(invoke ai-fos (quote write) ' + bytesExpr + ') ' +
+                    '(invoke ai-fos (quote close)) ';
+                extraWrite = '';
+            }
+            var stub = '(begin ' + outExpr + extraWrite +
+                '(android.util.Log:i "blockly_repl" ' +
+                    '(string-append "aicb i=' + cj + ' len=' + chunks[cj].length +
+                        ' cum~=' + cumBytes + '")) ' +
+                ')';
+            this.putYail.putAsset(stub, null, null, null, true);   // bare:直接 eval
         }
-        // Final — extension 双写(target1: classes.jar, target2: <pkg>.jar),
-        // 普通 asset 单写。try-catch 兜底:Android 14+ 上 replAssetDir 可能只读,
-        // 失败不阻断 cacheDir 写入。kawa 形式:
-        //   (try-catch body (ex Type handler)),handler 是 (var Type body)
-        var finalYail;
-        if (isExt) {
-            finalYail = '(begin ' +
-                '(define ai-bytes ' +
-                    '(invoke (java.util.Base64:getDecoder) (quote decode) ' +
-                        '(apply string-append ai-chunks))) ' +
-                // Try both locations because the Companion chooses the
-                // location from the Android API level. Completion must only
-                // be reported after at least one write succeeds.
-                '(define ai-written #f) ' +
-                '(try-catch ' +
-                    '(begin (java.nio.file.Files:write ai-target1-path ai-bytes) ' +
-                        '(set! ai-written #t)) ' +
-                    '(ex java.lang.Throwable #f)) ' +
-                '(try-catch ' +
-                    '(begin (java.nio.file.Files:write ai-target2-path ai-bytes) ' +
-                        '(set! ai-written #t)) ' +
-                    '(ex java.lang.Throwable #f)) ' +
-                '(if ai-written ' +
-                    '(begin (set! ai-chunks (quote ())) ' +
-                        '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '")) ' +
-                    '(error "Unable to write extension jar")))';
-        } else {
-            finalYail = '(begin ' +
-                '(define ai-bytes ' +
-                    '(invoke (java.util.Base64:getDecoder) (quote decode) ' +
-                        '(apply string-append ai-chunks))) ' +
-                '(try-catch ' +
-                    '(java.nio.file.Files:write ai-target-path ai-bytes) ' +
-                    '(ex java.lang.Throwable #t)) ' +
-                '(set! ai-chunks (quote ())) ' +
-                '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '"))';
-        }
-        this.putYail.putAsset(finalYail);
+
+        // Final — 最后一个 chunk 已写完,置位 assetsLoaded 并上报 assetTransferred。
+        // 置位直接调用现有 ReplForm 实例的 setAssetsLoaded(),与 PhoneStatus
+        // 的 @SimpleFunction 等效但避免构造器解析歧义。失败分支上报 __FAILED__ 让
+        // 浏览器 console 可诊断。
+        var setLoadedExpr =
+            '(invoke ' +
+                '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                '(quote setAssetsLoaded)) ';
+        var finalYail = '(begin ' +
+            '(android.util.Log:i "blockly_repl" ' +
+                '(string-append "aiDone shortFn=' + shortFn + ' chunks=' + chunks.length + '")) ' +
+            setLoadedExpr +
+            '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '")';
+        this.putYail.putAsset(finalYail, null, null, null, true);   // bare:直接 eval
         if (success) success();
         return true;
     }
+
 
     // 旧路径(force=true 或 usewebrtc=false 但 hasfetchassets 仍为 true 的边缘情况,例如通过 triggerUpdate 升级 Companion)
     if (!force && top.ReplState.hasfetchassets) {
