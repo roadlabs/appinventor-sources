@@ -1,5 +1,13 @@
 # Welcome to MIT App Inventor
 
+> **roadlabs fork note:** this checkout is a working copy of the App Inventor
+> sources extended into the **offline-webapp** product — a fully static,
+> Android-only App Inventor that runs from `offline-webapp/` with no App Engine
+> backend. The upstream content below is preserved for reference. See
+> [`CLAUDE.md`](CLAUDE.md) for the offline build commands and the WebRTC
+> asset-transfer fix, and the `appinventor-offline-webapp` skill for the full
+> offline fork delta.
+
 ## Introduction
 
 Learn more about [MIT App Inventor](http://appinventor.mit.edu).
