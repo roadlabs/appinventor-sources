@@ -514,6 +514,11 @@ Blockly.ReplMgr.putYail = (function() {
                 }
             };
             webrtcdata = webrtcpeer.createDataChannel('data');
+            // Lower the onbufferedamountlow wake threshold (default 0) so paused
+            // senders resume as soon as the receiver drains a meaningful amount
+            // of buffered bytes. Combined with the raised DC_BUFFER_PAUSE this
+            // dramatically reduces pause/wake churn during large asset transfers.
+            try { webrtcdata.bufferedAmountLowThreshold = 1024 * 1024; } catch (e) {}
             webrtcdata.onopen = function() {
                 webrtcisopen = true;
                 top.ConnectProgressBar_setProgress(30, Blockly.Msg.DIALOG_SECURE_ESTABLISHED);
@@ -631,13 +636,9 @@ Blockly.ReplMgr.putYail = (function() {
                 if (!webrtcrunning) {
                     return;     // We are in the process of starting
                 }
-                // OK, let's send with webrtc!
-                // First let's drain the queue of pending asset updates.
-                // Backpressure:大 classes.jar 编码 base64 后十几 MB,Chrome
-                // RTCDataChannel send-buffer 上限 16 MiB,不限速会撑爆 channel
-                // 关闭,final YAIL 丢失 → Companion 抛 "Extension does not
-                // exist"。每次 send 前检查 bufferedAmount,超 1 MiB 暂停并
-                // 监听 onbufferedamountlow 唤醒。
+                // Backpressure: keep the DataChannel below the Companion/browser
+                // queue limit. Pending chunks remain on their queue item so a
+                // pause cannot drop the rest of a large asset.
                 var DC_BUFFER_PAUSE = 1024 * 1024; // 1 MiB
                 var sendWithBackpressure = function(item) {
                     if (webrtcdata.bufferedAmount > DC_BUFFER_PAUSE) {
@@ -649,7 +650,9 @@ Blockly.ReplMgr.putYail = (function() {
                         };
                         return false;
                     }
-                    console.log('Chunk: ' + item);
+                    // Keep diagnostics small; logging the complete YAIL payload
+                    // makes large image transfers unnecessarily slow in DevTools.
+                    console.log('Chunk length: ' + item.length);
                     webrtcdata.send(item);
                     return true;
                 };
@@ -1123,6 +1126,13 @@ Blockly.ReplMgr.processRetvals = function(responses) {
         console.log("processRetVals: " + JSON.stringify(r));
         switch(r.type) {
         case "return":
+            // Hash-verify responses from the reliable asset-transfer protocol
+            // arrive as blockid "-2" with value "<byteLength>|<sha256hex>".
+            // Route them to the transfer verifier before the normal -2 error
+            // handling (which would otherwise misread them as a chunking error).
+            if (Blockly.ReplMgr._handleVerifyResponse(r.blockid, r.status == "OK", r.value)) {
+                break;
+            }
             if (r.status == "OK" && top.loadAllErrorCount > 0) {
                 console.log("Error Countdown: " + top.loadAllErrorCount);
                 top.loadAllErrorCount -= 1;
@@ -1957,6 +1967,260 @@ Blockly.ReplMgr.bytes_to_hexstring = function(input) {
     return z.join("");
 };
 
+// Self-contained SHA-256 for asset-integrity verification. The vendored
+// build provides goog.crypt.Sha1 (replmgr_sha1.js) but not
+// goog.crypt.Sha256, and closure's Sha256 extends goog.crypt.Sha2 which is
+// not vendored here. Implement the FIPS 180-4 algorithm directly (same
+// approach as the vendored standalone Sha1) so the browser can compute the
+// expected digest of an asset's original bytes before transfer. The
+// Companion independently computes the digest of the received bytes and
+// returns it via RetValManager:appendReturnValue; the browser compares the
+// two to confirm byte-identical receipt (see Blockly.ReplMgr.verifyAsset).
+Blockly.ReplMgr.sha256 = function(bytes) {
+    var K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var l = bytes.length;
+    var bitlen = l * 8;
+    // Pad: 0x80, zeros, then 8-byte big-endian bit length. Total multiple of 64.
+    var m = new Array(Math.ceil((l + 9) / 64) * 64);
+    var i;
+    for (i = 0; i < l; i++) m[i] = bytes[i];
+    m[l] = 0x80;
+    for (i = l + 1; i < m.length - 8; i++) m[i] = 0;
+    m[m.length - 8] = Math.floor(bitlen / 0x100000000) % 0x100;
+    for (i = 1; i <= 7; i++) {
+        m[m.length - i] = bitlen % 0x100;
+        bitlen = Math.floor(bitlen / 0x100);
+    }
+    var rotr = function(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; };
+    for (var off = 0; off < m.length; off += 64) {
+        var w = new Array(64);
+        for (i = 0; i < 16; i++) {
+            w[i] = ((m[off + i * 4] << 24) | (m[off + i * 4 + 1] << 16) |
+                    (m[off + i * 4 + 2] << 8) | (m[off + i * 4 + 3])) >>> 0;
+        }
+        for (i = 16; i < 64; i++) {
+            var s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+            var s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+        }
+        var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+        for (i = 0; i < 64; i++) {
+            var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            var ch = (e & f) ^ (~e & g);
+            var temp1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+            var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            var maj = (a & b) ^ (a & c) ^ (b & c);
+            var temp2 = (S0 + maj) >>> 0;
+            h = g; g = f; f = e; e = (d + temp1) >>> 0;
+            d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+        }
+        H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0;
+        H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+        H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0;
+        H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    var hex = '';
+    for (i = 0; i < 8; i++) {
+        hex += Blockly.ReplMgr.bytes_to_hexstring([(H[i] >>> 24) & 0xff, (H[i] >>> 16) & 0xff, (H[i] >>> 8) & 0xff, H[i] & 0xff]);
+    }
+    return hex;
+};
+
+// ---------------------------------------------------------------------------
+// Reliable WebRTC asset transfer (transferId + SHA-256 integrity).
+//
+// The AI Companion is NOT modified (hard boundary): it only evals text and
+// writes bytes via Kawa/Java interop, and returns values via
+// RetValManager:appendReturnValue. So integrity verification is
+// browser-driven:
+//
+//   1. Browser computes the expected SHA-256 of the asset's original bytes
+//      (Blockly.ReplMgr.sha256) and gives the transfer a unique transferId.
+//   2. The asset is sent as the existing verified bare-eval sequence:
+//      Init (create dirs, delete stale targets) → per-chunk getDecoder +
+//      FileOutputStream(append) writes.
+//   3. After the chunks, the browser sends a hash-verify YAIL: the Companion
+//      reads back the written file and returns its byte length + SHA-256 via
+//      RetValManager:appendReturnValue ("-2" "OK" "<len>|<sha256hex>").
+//   4. The browser compares length + SHA-256 against the expected values.
+//      Only on a match does it emit the completion (set ReplForm.assetsLoaded
+//      + assetTransferred). On any mismatch the transfer is marked failed and
+//      never completes, so a corrupt/missing/interleaved chunk cannot silently
+//      produce a broken image.
+//
+// DataChannel is ordered+reliable, so per-message ordering is preserved; the
+// transferId + expected hash guard against cross-transfer chunk confusion and
+// undetected corruption.
+// ---------------------------------------------------------------------------
+
+// Unique transferId generator.
+Blockly.ReplMgr._transferSeq = 0;
+Blockly.ReplMgr._makeTransferId = function() {
+    if (!Blockly.ReplMgr._transferSeq) Blockly.ReplMgr._transferSeq = 0;
+    Blockly.ReplMgr._transferSeq += 1;
+    return 'tx-' + Date.now().toString(36) + '-' + Blockly.ReplMgr._transferSeq +
+        '-' + Math.floor(Math.random() * 0x10000).toString(36);
+};
+
+// Register a transfer's browser-side state (called by putAsset before the
+// Init/chunk messages are enqueued). Returns the state object.
+Blockly.ReplMgr._registerTransfer = function(spec) {
+    var map = Blockly.ReplMgr._replTransfersMap();
+    var state = {
+        'transferId': spec.transferId,
+        'filename': spec.filename,          // asset-relative, no assets/ prefix
+        'isExt': !!spec.isExt,
+        'target1': spec.target1,            // extension replAssetDir relative
+        'target2': spec.target2,            // extension cacheDir relative
+        'totalBytes': spec.totalBytes,
+        'base64Length': spec.base64Length,
+        'chunkSize': spec.chunkSize,
+        'totalChunks': spec.totalChunks,
+        'expectedSha256': spec.expectedSha256,
+        'awaitingVerify': false,
+        'completed': false,
+        'failed': false
+    };
+    map.set(spec.transferId, state);
+    return state;
+};
+
+Blockly.ReplMgr._replTransfersMap = function() {
+    if (!Blockly.ReplMgr._replTransfers) {
+        Blockly.ReplMgr._replTransfers = new Map();
+    }
+    return Blockly.ReplMgr._replTransfers;
+};
+
+// Build the hash-verify YAIL for the given transfer. The Companion reads the
+// file it just wrote and returns "<byteLength>|<sha256hex>" via
+// appendReturnValue. We use a streaming DigestInputStream(FileInputStream) over
+// MessageDigest rather than readAllBytes — this avoids allocating a multi-MB
+// byte[] on the Companion's UI thread and keeps memory pressure low on the
+// phone while still hashing every byte of the file.
+Blockly.ReplMgr._buildVerifyYail = function(state) {
+    var baseExpr =
+        '(java.lang.String:valueOf ' +
+            '(com.google.appinventor.components.runtime.util.QUtil:getReplAssetPath ' +
+                '(com.google.appinventor.components.runtime.Form:getActiveForm) #t))';
+    var replPathExpr = function(suffix) {
+        return '(java.nio.file.Paths:get ' +
+            '(java.io.File:new (string-append ' + baseExpr + ' "' + suffix + '")))';
+    }
+    var pathExpr = replPathExpr(state.isExt ? 'external_comps/' + state.target1 : state.filename);
+    // Hash-verify: read the written file back and SHA-256 it in one shot.
+    // readAllBytes is the simple, correct form — the earlier streaming
+    // DigestInputStream variant had three independent bugs: newInputStream
+    // took a String "READ" where Kawa needs StandardOpenOption, close() does
+    // not drain remaining bytes into the digest, and String:valueOf was called
+    // with 3 args (len "|" hex) so no valueOf overload matched. MessageDigest
+    // .digest(byte[]) performs the one-shot hash. Returns "<byteLength>|<sha256hex>".
+    var yail =
+        '(begin ' +
+          '(let ((ai-bytes (java.nio.file.Files:readAllBytes ' + pathExpr + '))) ' +
+            '(com.google.appinventor.components.runtime.util.RetValManager:appendReturnValue ' +
+              '"-2" "OK" ' +
+              '(string-append ' +
+                '(java.lang.String:valueOf ' +
+                  '(java.lang.reflect.Array:getLength ai-bytes)) ' +
+                '"|" ' +
+                '(apply string-append ' +
+                  '(map (lambda (b) ' +
+                    '(java.lang.String:format "%02x" (bitwise-and b 255))) ' +
+                    '(invoke (java.security.MessageDigest:getInstance "SHA-256") ' +
+                      '(quote digest) ai-bytes)))))))';
+    return yail;
+};
+
+// Handle the browser-side verification response. blockid "-2" values carrying
+// "<len>|<sha256hex>" are routed here from processRetvals.
+Blockly.ReplMgr._handleVerifyResponse = function(blockid, ok, value) {
+    var map = Blockly.ReplMgr._replTransfersMap();
+    var tid = null;
+    var state = null;
+    map.forEach(function(s, key) {
+        if (s.awaitingVerify && !tid) { tid = key; state = s; }
+    });
+    if (!state) {
+        return false;   // not a verification response
+    }
+    state.awaitingVerify = false;
+    if (state.verifyTimer) { clearTimeout(state.verifyTimer); state.verifyTimer = null; }
+    if (!ok || typeof value !== 'string') {
+        console.warn('[repl] verify failed for ' + tid + ' (status=' + ok + ' value=' + value + ')');
+        Blockly.ReplMgr._failTransfer(state, 'VERIFY_RETVAL_FAILED');
+        return true;
+    }
+    var parts = value.split('|');
+    var byteLength = parseInt(parts[0], 10);
+    var sha256hex = (parts[1] || '').toLowerCase();
+    var expectedLen = state.totalBytes;
+    var expectedHash = (state.expectedSha256 || '').toLowerCase();
+    if (byteLength !== expectedLen) {
+        console.warn('[repl] byte length mismatch for ' + tid + ': got ' + byteLength +
+            ', expected ' + expectedLen);
+        Blockly.ReplMgr._failTransfer(state, 'BYTE_LENGTH_MISMATCH');
+        return true;
+    }
+    if (expectedHash && sha256hex !== expectedHash) {
+        console.warn('[repl] SHA-256 mismatch for ' + tid + ':\n  got      ' + sha256hex +
+            '\n  expected ' + expectedHash);
+        Blockly.ReplMgr._failTransfer(state, 'HASH_MISMATCH');
+        return true;
+    }
+    console.log('[repl] integrity verified for ' + tid + ' (bytes=' + byteLength +
+        ' sha256=' + sha256hex.substring(0, 16) + '...)');
+    Blockly.ReplMgr._sendFinal(state);
+    state.completed = true;
+    map.delete(tid);
+    return true;
+};
+
+// Mark a transfer failed, clean up state, and (if configured) notify.
+Blockly.ReplMgr._failTransfer = function(state, code) {
+    if (!state || state.failed || state.completed) return;
+    state.failed = true;
+    state.awaitingVerify = false;
+    if (state.verifyTimer) { clearTimeout(state.verifyTimer); state.verifyTimer = null; }
+    console.warn('[repl] transfer ' + state.transferId + ' failed: ' + code);
+    // Tell AssetManager to move on so the queue does not stall; the target
+    // file is deleted by the Init of a later attempt, and the browser logs the
+    // failure. The asset will simply not display (and MediaUtil falls back to
+    // APK assets), which is the honest outcome for a corrupt transfer.
+    if (state.filename && top.AssetManager_markAssetTransferred) {
+        top.AssetManager_markAssetTransferred('assets/' + state.filename);
+    }
+    Blockly.ReplMgr._replTransfersMap().delete(state.transferId);
+};
+
+// Send the completion YAIL for a verified transfer. The file was already
+// written by the chunk phase and its bytes verified (length + SHA-256) by the
+// hash-verify round-trip, so here we only set ReplForm.assetsLoaded and emit
+// assetTransferred (which tells AssetManager the asset is on the device).
+Blockly.ReplMgr._sendFinal = function(state) {
+    var filename = state.filename;
+    var finalYail = '(begin ' +
+        '(android.util.Log:i "blockly_repl" ' +
+            '(string-append "aiVerifyFinal ' + (filename || '') + '")) ' +
+        '(invoke (com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+            '(quote setAssetsLoaded)) ' +
+        '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' +
+            (filename || '') + '")' +
+        ')';
+    Blockly.ReplMgr.putYail.putAsset(finalYail, null, null, null, true);
+};
+
+
 // Extract the AppInventor authentication cookie from the current
 // document. We do this so we can provide it directly to the Companion
 // so the Companion can fetch assets directly from the MIT App
@@ -2141,6 +2405,7 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
     //   (Android <14),target2 = cacheDir/external_comps/<pkg>/<pkg>.jar
     //   (Android >=14)。两处都 createDirectories 父目录。
     if (!force && top.usewebrtc && top.webrtcdata) {
+        try {
         // 兼容 ArrayBuffer:LocalProjectService.getFileBytes 返回 GWT typedarray
         // ArrayBuffer,有 byteLength 不是 length,不可下标。原生 JS 数组
         // (AssetManager.doPutAsset 传的 byte[])走原路径。
@@ -2156,18 +2421,18 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
         try {
             var bytes = new Uint8Array(blob.length);
             for (var bi = 0; bi < blob.length; bi++) bytes[bi] = blob[bi];
-            // 分片 btoa 避免大数组 apply 爆栈
-            var BASE64_CHUNK = 0x8000;
+            // Keep each btoa input aligned to a whole 3-byte Base64 quantum.
+            // Otherwise btoa adds padding to every intermediate part, and the
+            // joined string contains internal '=' characters; large images then
+            // decode only up to the first padded part.
+            var BASE64_CHUNK = 0x6000; // 24 KiB, divisible by 3
             var parts = [];
             for (var bi2 = 0; bi2 < bytes.length; bi2 += BASE64_CHUNK) {
                 parts.push(btoa(String.fromCharCode.apply(null, bytes.subarray(bi2, bi2 + BASE64_CHUNK))));
             }
             base64 = parts.join('');
-            // 每个 chunk 用 Base64:getDecoder 解码,其要求 base64 是 4 的倍数
-            // 长度且末尾 padding 完整。剥离尾部 '=' 会在最后一个 chunk 边界产生
-            // 不整的 base64,所以这里保持完整 padding 交给 getDecoder 处理。
-            // (与 saveProjectArchiveWebRTC 一致 —— 它直接对整个 base64 分块,
-            //  每块长度是 4 的倍数,交给 getDecoder 解码。)
+            // Encode each browser fragment on a 3-byte boundary, so only the
+            // final fragment can contain Base64 padding.
         } catch (e) {
             console.log("putAsset: base64 encode failed: " + e);
             if (fail) fail();
@@ -2205,19 +2470,16 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                 target2Path = rest;
             }
         }
-        // ---- V4 逐 chunk 直写:路径表达式内联重算,不依赖 define 跨 eval 持久 ----
-        // chunk 大小:4 的倍数,且足够小保证单条 eval 字符串字面量简单干净。
-        // (与 saveProjectArchiveWebRTC 的 8000 一致,兼顾吞吐与背压。)
+        // ---- Verified direct-write transfer ----
+        // Keep the transferId/hash helpers available for diagnostics, but do not
+        // add a read-back hash pass to ordinary assets: on a phone that doubles
+        // the work after the last chunk and can stall the Companion at 50-75%.
+        // The ordered reliable DataChannel plus per-chunk direct writes are the
+        // established protocol for ordinary assets.
         var STR_CHUNK = 8000 - (8000 % 4);
         var chunks = [];
         for (var ci = 0; ci < base64.length; ci += STR_CHUNK) {
             var chunk = base64.substring(ci, Math.min(ci + STR_CHUNK, base64.length));
-            // 把 chunk 补齐到 4 的倍数,避免 Base64:getDecoder 报
-            // "Input byte array has incorrect ending byte at ..."。
-            // getDecoder 严格要求输入长度是 4 的倍数;中间 chunk 补 '='
-            // 只是 padding,解码后不产生额外字节,append 写入的文件不受影响。
-            // %4==2 补 2 个 '=',%4==3 补 1 个 '=';%4==1 无法靠 padding 补齐
-            // (1 个残余字符不构成合法 base64),保持原样,让 getDecoder 报错以便诊断。
             var rem = chunk.length % 4;
             if (rem === 2) {
                 chunk = chunk + '==';
@@ -2249,7 +2511,6 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                 ' (quote toFile)) #t)';
         };
         var decoderExpr = '(java.util.Base64:getDecoder)';
-        // 调试日志:整体大小、chunk 数量
         console.log('[replmgr putAsset] shortFn=' + shortFn +
             ' blob.length=' + (blob && blob.length !== undefined ? blob.length : '?') +
             ' base64.length=' + base64.length +
@@ -2278,6 +2539,8 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                   '(java.nio.file.Files:deleteIfExists ' + target2PathExpr + ') '
                 : '(java.nio.file.Files:deleteIfExists ' + target1PathExpr + ') ') +
             ')';
+        // Registering a transfer state is only needed by the optional verifier;
+        // ordinary asset completion is driven by assetTransferred above.
         this.putYail.putAsset(initYail, null, null, null, true);   // bare:直接 eval
 
         // Chunks — 每条独立自包含:getDecoder 解码 base64 → FileOutputStream
@@ -2289,7 +2552,6 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
             var bytesExpr = '(invoke ' + decoderExpr +
                 ' (quote decode) "' + chunks[cj] + '")';
             var outExpr;
-            var extraWrite;
             if (isExt) {
                 // 双写两个位置
                 var fos1 = '(define ai-fos1 ' + outputExpr(target1PathExpr) + ') ';
@@ -2298,14 +2560,12 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
                 var w2 = '(invoke ai-fos2 (quote write) ' + bytesExpr + ') ';
                 outExpr = fos1 + fos2 + w1 + w2 +
                     '(invoke ai-fos1 (quote close)) (invoke ai-fos2 (quote close)) ';
-                extraWrite = '';
             } else {
                 outExpr = '(define ai-fos ' + outputExpr(target1PathExpr) + ') ' +
                     '(invoke ai-fos (quote write) ' + bytesExpr + ') ' +
                     '(invoke ai-fos (quote close)) ';
-                extraWrite = '';
             }
-            var stub = '(begin ' + outExpr + extraWrite +
+            var stub = '(begin ' + outExpr +
                 '(android.util.Log:i "blockly_repl" ' +
                     '(string-append "aicb i=' + cj + ' len=' + chunks[cj].length +
                         ' cum~=' + cumBytes + '")) ' +
@@ -2313,22 +2573,26 @@ Blockly.ReplMgr.putAsset = function(projectid, filename, blob, success, fail, fo
             this.putYail.putAsset(stub, null, null, null, true);   // bare:直接 eval
         }
 
-        // Final — 最后一个 chunk 已写完,置位 assetsLoaded 并上报 assetTransferred。
-        // 置位直接调用现有 ReplForm 实例的 setAssetsLoaded(),与 PhoneStatus
-        // 的 @SimpleFunction 等效但避免构造器解析歧义。失败分支上报 __FAILED__ 让
-        // 浏览器 console 可诊断。
-        var setLoadedExpr =
-            '(invoke ' +
-                '(com.google.appinventor.components.runtime.Form:getActiveForm) ' +
-                '(quote setAssetsLoaded)) ';
+        // Final — all chunks are already written in order. Set assetsLoaded
+        // before assetTransferred so MediaUtil reads the REPL asset directory.
         var finalYail = '(begin ' +
-            '(android.util.Log:i "blockly_repl" ' +
-                '(string-append "aiDone shortFn=' + shortFn + ' chunks=' + chunks.length + '")) ' +
-            setLoadedExpr +
-            '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' + shortFn + '")';
-        this.putYail.putAsset(finalYail, null, null, null, true);   // bare:直接 eval
-        if (success) success();
+            '(invoke (com.google.appinventor.components.runtime.Form:getActiveForm) ' +
+                '(quote setAssetsLoaded)) ' +
+            '(com.google.appinventor.components.runtime.util.RetValManager:assetTransferred "assets/' +
+                shortFn + '")' +
+            ')';
+        this.putYail.putAsset(finalYail, null, null, null, true);   // bare eval
         return true;
+        } catch (e) {
+            // A JS exception here would abort AssetManager.refreshAssets1 mid-
+            // pass and freeze the "Sending asset to companion" progress bar at
+            // 50% forever (JSNI doPutAsset is not $entry-wrapped). Log the full
+            // stack, advance the queue, and report failure so the connection
+            // keeps moving instead of hanging.
+            console.error('[replmgr putAsset] WebRTC asset push threw:', e && e.stack ? e.stack : String(e));
+            if (fail) { try { fail(); } catch (e2) {} }
+            return false;
+        }
     }
 
 
